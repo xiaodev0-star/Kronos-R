@@ -1,29 +1,16 @@
 # -*- coding: utf-8 -*-
-"""Comprehensive benchmark comparing all three inference versions vs baseline.
+"""Kronos-R 推理基准测试 + 质量验证
 
-Runs controlled benchmarks across:
-  - v0: Original baseline (full forward each AR step)
-  - v1: KV-Cache optimization
-  - v2: KV-Cache + torch.compile + AMP
-  - v3: KV-Cache + torch.compile + AMP + Batch processing
+测试内容:
+  1. 速度基准: 不同batch_size下的吞吐量
+  2. 质量验证: 优化版与原版推理结果对比
+  3. 全量估算: 4000 stocks预测时间预估
 
-Measures:
-  - Latency (ms per stock per horizon)
-  - Throughput (stocks/sec)
-  - GPU memory usage
-  - Prediction accuracy (MAPE, DA)
-
-Usage:
-    python -m Inference.benchmark --horizon 10 --runs 20 --batch-sizes 1,2,4,8
+用法:
+    python -m Inference.benchmark --horizon 10 --num-stocks 200
 """
 
-import argparse
-import gc
-import json
-import os
-import sys
-import time
-
+import argparse, json, os, sys, time
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -36,315 +23,168 @@ from Inference.utils import (
     load_rollout_data, prepare_inference_batch, compute_metrics, Timer,
     baseline_ar_predict, report_memory,
 )
+from Inference.v2_fast import v2_predict
 
 
-# ─── Benchmark Runner ─────────────────────────────────────────────────────────
-
-def benchmark_all(
-    device,
-    model,
-    tokenizer,
-    payload,
-    horizon=10,
-    num_runs=20,
-    num_stocks=10,
-    batch_sizes=[1, 2, 4, 8],
-    use_amp=True,
-    amp_dtype="bf16",
-    use_compile=True,
-):
-    """Run comprehensive benchmarks across all versions and batch sizes."""
-
-    results = {
-        "device": str(device),
-        "gpu_name": torch.cuda.get_device_name(0) if device.type == "cuda" else "CPU",
-        "horizon": horizon,
-        "num_runs": num_runs,
-        "versions": {},
-    }
-
-    # Select stock indices
-    total_windows = payload["features"].size(0)
+@torch.inference_mode()
+def verify_quality(model, tokenizer, payload, num_stocks=100, bs=32):
+    """验证优化版(v2)与原版推理结果的一致性。"""
     rng = np.random.default_rng(42)
-    stock_indices = rng.choice(
-        min(total_windows, max(num_stocks, max(batch_sizes) * 4)),
-        size=min(num_stocks * 3, total_windows),
-        replace=False,
-    ).tolist()
+    total = payload["features"].size(0)
+    indices = rng.choice(total, size=min(num_stocks, total), replace=False).tolist()
+    horizon = 10
 
-    print(f"\n{'='*70}")
-    print(f"Kronos-R Inference Benchmark — {results['gpu_name']}")
-    print(f"Horizon: {horizon} steps, {num_runs} runs per test")
-    print(f"{'='*70}")
+    # 参考: 逐stock bs=1
+    ref_preds = []
+    for i in tqdm(indices, desc="  参考(bs=1)"):
+        b = prepare_inference_batch(payload, torch.tensor([i]), device)
+        with autocast_ctx(device, True, "bf16"):
+            p = v2_predict(model, tokenizer, b["features"], b["means"],
+                          b["stds"], b["time"], horizon, device)
+        ref_preds.append(p.cpu())
+    ref = torch.cat(ref_preds, dim=0).numpy()
 
-    # ─── v0: Baseline ───
-    print(f"\n─── v0: Baseline (Full Forward each step) ───")
-    baseline_times = []
-    for run in tqdm(range(num_runs), desc="  Baseline"):
-        idx = stock_indices[run % len(stock_indices)]
-        batch = prepare_inference_batch(payload, torch.tensor([idx]), device)
-        with Timer(sync_cuda=True) as t:
-            _ = baseline_ar_predict(
-                model, tokenizer, batch["features"], batch["means"],
-                batch["stds"], batch["time"], horizon, device,
-                use_amp=use_amp, amp_dtype=amp_dtype,
-            )
-        baseline_times.append(t.ms)
+    # 优化版: 批次处理
+    batch_preds = []
+    for start in tqdm(range(0, len(indices), bs), desc=f"  批次(bs={bs})"):
+        end = min(start + bs, len(indices))
+        b = prepare_inference_batch(payload, torch.tensor(indices[start:end]), device)
+        with autocast_ctx(device, True, "bf16"):
+            p = v2_predict(model, tokenizer, b["features"], b["means"],
+                          b["stds"], b["time"], horizon, device)
+        batch_preds.append(p.cpu())
+    batch = torch.cat(batch_preds, dim=0).numpy()
 
-    baseline_mean = float(np.mean(baseline_times))
-    baseline_std = float(np.std(baseline_times))
-    print(f"  Mean: {baseline_mean:.2f} ± {baseline_std:.2f} ms")
-    results["versions"]["v0_baseline"] = {
-        "mean_ms": baseline_mean, "std_ms": baseline_std,
-        "speedup": 1.0,
+    # 逐stock对比
+    max_diffs = np.abs(ref - batch).max(axis=1)
+    da_per_stock = (np.sign(ref) == np.sign(batch)).mean(axis=1) * 100
+    exact = (max_diffs == 0).sum()
+
+    # 聚合指标
+    actual = payload["actual_returns"][indices].numpy()
+    ref_m = compute_metrics(ref.reshape(-1), actual.reshape(-1))
+    batch_m = compute_metrics(batch.reshape(-1), actual.reshape(-1))
+
+    return {
+        "num_stocks": len(indices),
+        "exact_match": int(exact),
+        "exact_pct": float(exact / len(indices) * 100),
+        "direction_agree_mean": float(da_per_stock.mean()),
+        "max_diff_mean": float(max_diffs.mean()),
+        "max_diff_max": float(max_diffs.max()),
+        "mape_ref": ref_m["mape"],
+        "mape_batch": batch_m["mape"],
+        "mape_delta": abs(ref_m["mape"] - batch_m["mape"]),
+        "da_ref": ref_m["da"],
+        "da_batch": batch_m["da"],
+        "da_delta": abs(ref_m["da"] - batch_m["da"]),
     }
 
-    # ─── v1: KV-Cache ───
-    print(f"\n─── v1: KV-Cache ───")
-    from Inference.v1_kv_cache import v1_ar_predict
-
-    v1_times = []
-    for run in tqdm(range(num_runs), desc="  v1"):
-        idx = stock_indices[run % len(stock_indices)]
-        batch = prepare_inference_batch(payload, torch.tensor([idx]), device)
-        with Timer(sync_cuda=True) as t:
-            _ = v1_ar_predict(
-                model, tokenizer, batch["features"], batch["means"],
-                batch["stds"], batch["time"], horizon, device,
-                use_amp=use_amp, amp_dtype=amp_dtype,
-            )
-        v1_times.append(t.ms)
-        if hasattr(model, 'clear_runtime_caches'):
-            model.clear_runtime_caches()
-
-    v1_mean = float(np.mean(v1_times))
-    print(f"  Mean: {v1_mean:.2f} ± {float(np.std(v1_times)):.2f} ms")
-    print(f"  Speedup vs baseline: {baseline_mean / v1_mean:.2f}x")
-    results["versions"]["v1_kv_cache"] = {
-        "mean_ms": v1_mean, "std_ms": float(np.std(v1_times)),
-        "speedup": baseline_mean / v1_mean,
-    }
-
-    # ─── v2: Compile + AMP ───
-    print(f"\n─── v2: torch.compile + AMP + KV-Cache ───")
-
-    if use_compile and device.type == "cuda":
-        print("  Compiling model (mode='reduce-overhead')...")
-        try:
-            compiled_model = torch.compile(model, mode="reduce-overhead", dynamic=False)
-        except Exception:
-            compiled_model = torch.compile(model, mode="reduce-overhead", dynamic=True)
-        # Warmup compilation
-        print("  Warming up compiled model...")
-        for i in range(3):
-            idx = stock_indices[i]
-            batch = prepare_inference_batch(payload, torch.tensor([idx]), device)
-            _ = v1_ar_predict(
-                compiled_model, tokenizer, batch["features"], batch["means"],
-                batch["stds"], batch["time"], horizon, device,
-                use_amp=use_amp, amp_dtype=amp_dtype,
-            )
-            if hasattr(compiled_model, 'clear_runtime_caches'):
-                compiled_model.clear_runtime_caches()
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-    else:
-        compiled_model = model
-
-    v2_times = []
-    for run in tqdm(range(num_runs), desc="  v2"):
-        idx = stock_indices[run % len(stock_indices)]
-        batch = prepare_inference_batch(payload, torch.tensor([idx]), device)
-        with Timer(sync_cuda=True) as t:
-            _ = v1_ar_predict(
-                compiled_model, tokenizer, batch["features"], batch["means"],
-                batch["stds"], batch["time"], horizon, device,
-                use_amp=use_amp, amp_dtype=amp_dtype,
-            )
-        v2_times.append(t.ms)
-        if hasattr(compiled_model, 'clear_runtime_caches'):
-            compiled_model.clear_runtime_caches()
-
-    v2_mean = float(np.mean(v2_times))
-    print(f"  Mean: {v2_mean:.2f} ± {float(np.std(v2_times)):.2f} ms")
-    print(f"  Speedup vs baseline: {baseline_mean / v2_mean:.2f}x")
-    print(f"  Speedup vs v1: {v1_mean / v2_mean:.2f}x")
-    results["versions"]["v2_compile_amp"] = {
-        "mean_ms": v2_mean, "std_ms": float(np.std(v2_times)),
-        "speedup": baseline_mean / v2_mean,
-        "speedup_vs_v1": v1_mean / v2_mean,
-    }
-
-    # ─── v3: Batch Processing ───
-    v3_results = {}
-    for bs in batch_sizes:
-        if bs < 1:
-            continue
-        print(f"\n─── v3: Batch Processing (batch_size={bs}) ───")
-
-        batched_indices = []
-        for start in range(0, len(stock_indices[:num_stocks * 2]), bs):
-            end = min(start + bs, len(stock_indices[:num_stocks * 2]))
-            if end - start == bs:  # Only keep full batches for fair timing
-                batched_indices.append(stock_indices[start:end])
-
-        if not batched_indices:
-            print("  Skipping — not enough stocks for this batch size")
-            continue
-
-        batch_times = []
-        for run in tqdm(range(min(num_runs, len(batched_indices))), desc=f"  v3_bs{bs}"):
-            batch_idx = batched_indices[run % len(batched_indices)]
-            batch = prepare_inference_batch(
-                payload, torch.tensor(batch_idx, dtype=torch.long), device
-            )
-
-            with autocast_ctx(device, use_amp, amp_dtype):
-                idx_c, idx_f = tokenizer.encode(batch["features"])
-
-            with autocast_ctx(device, use_amp, amp_dtype):
-                pred_c, pred_f = compiled_model.predict_ar_kv_cache(
-                    idx_c, idx_f,
-                    batch["time"]["minute"][:, :batch["prefix_len"]],
-                    batch["time"]["day"][:, :batch["prefix_len"]],
-                    batch["time"]["month"][:, :batch["prefix_len"]],
-                    batch["time"]["year"][:, :batch["prefix_len"]],
-                    horizon=horizon, temperature=1.0, use_sampling=False,
-                )
-
-            if device.type == "cuda":
-                torch.cuda.synchronize()
-
-            t_start = time.perf_counter()
-            for step in range(horizon):
-                decoded = tokenizer.decode(pred_c[:, step:step+1], pred_f[:, step:step+1])
-                _ = decoded[:, 0, 0].float() * batch["stds"][:, 0] + batch["means"][:, 0]
-            if device.type == "cuda":
-                torch.cuda.synchronize()
-            t_total = (time.perf_counter() - t_start) * 1000
-
-            # Only timing the AR loop, not decode (separate concern)
-            batch_times.append(t_total / bs)  # per-stock time
-
-            if hasattr(compiled_model, 'clear_runtime_caches'):
-                compiled_model.clear_runtime_caches()
-
-        batch_mean = float(np.mean(batch_times))
-        print(f"  Per-stock mean: {batch_mean:.2f} ± {float(np.std(batch_times)):.2f} ms")
-        print(f"  Speedup vs baseline: {baseline_mean / batch_mean:.2f}x")
-
-        v3_results[f"v3_batch_{bs}"] = {
-            "batch_size": bs,
-            "per_stock_mean_ms": batch_mean,
-            "per_stock_std_ms": float(np.std(batch_times)),
-            "speedup": baseline_mean / batch_mean,
-        }
-
-    results["versions"]["v3_batch"] = v3_results
-
-    return results, compiled_model
-
-
-# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Comprehensive inference benchmark")
+    parser = argparse.ArgumentParser(description="Kronos-R 推理基准测试")
     parser.add_argument("--horizon", type=int, default=10)
-    parser.add_argument("--runs", type=int, default=20)
-    parser.add_argument("--num-stocks", type=int, default=10)
-    parser.add_argument("--batch-sizes", type=str, default="1,2,4,8")
-    parser.add_argument("--mode", default="demo")
-    parser.add_argument("--checkpoint", default=None)
-    parser.add_argument("--tokenizer-path", default=None)
-    parser.add_argument("--use-amp", action="store_true", default=True)
-    parser.add_argument("--no-amp", dest="use_amp", action="store_false")
-    parser.add_argument("--amp-dtype", default="bf16")
-    parser.add_argument("--no-compile", dest="use_compile", action="store_false", default=True)
-    parser.add_argument("--output-dir", default="outputs/benchmark")
-    parser.add_argument("--save-model", action="store_true",
-                        help="Save the compiled model for reuse")
+    parser.add_argument("--num-stocks", type=int, default=200)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--verify", action="store_true", default=True)
+    parser.add_argument("--output-dir", default="outputs")
     args = parser.parse_args(argv)
 
     device = setup_device()
+    model, tokenizer = load_model_and_tokenizer(device)
+    model.eval()
+    payload = load_rollout_data("demo")
 
-    batch_sizes = [int(x.strip()) for x in args.batch_sizes.split(",") if x.strip().isdigit()]
-    if not batch_sizes:
-        batch_sizes = [1]
+    print(f"\n{'='*60}")
+    print(f"Kronos-R Inference Benchmark")
+    print(f"{'='*60}")
+    print(f"Device: {torch.cuda.get_device_name(0)}")
+    print(f"Model:  {sum(p.numel() for p in model.parameters()):,} params")
+    print(f"Data:   {payload['features'].size(0)} demo windows")
 
-    # Load model
-    print("Loading model...")
-    model, tokenizer = load_model_and_tokenizer(
-        device, args.checkpoint, args.tokenizer_path
-    )
-    print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    # ─── 质量验证 ───
+    if args.verify:
+        print(f"\n[1] 质量验证 (优化版 vs 原版)...")
+        quality = verify_quality(model, tokenizer, payload, num_stocks=100, bs=args.batch_size)
 
-    # Load data
-    print(f"Loading {args.mode} data...")
-    payload = load_rollout_data(args.mode)
+        print(f"  Stock数量:     {quality['num_stocks']}")
+        print(f"  完全一致:      {quality['exact_match']}/{quality['num_stocks']} "
+              f"({quality['exact_pct']:.1f}%)")
+        print(f"  方向一致性:    {quality['direction_agree_mean']:.1f}%")
+        print(f"  平均最大差异:  {quality['max_diff_mean']:.8f}")
+        print(f"  最大差异:      {quality['max_diff_max']:.8f}")
+        print(f"  MAPE: ref={quality['mape_ref']:.4f}% batch={quality['mape_batch']:.4f}% "
+              f"(delta={quality['mape_delta']:.4f}%)")
+        print(f"  DA:   ref={quality['da_ref']:.2f}% batch={quality['da_batch']:.2f}% "
+              f"(delta={quality['da_delta']:.2f}%)")
 
-    # Run benchmark
-    print(f"\nStarting benchmark ({args.runs} runs, horizon={args.horizon})...")
-    results, compiled_model = benchmark_all(
-        device, model, tokenizer, payload,
-        horizon=args.horizon,
-        num_runs=args.runs,
-        num_stocks=args.num_stocks,
-        batch_sizes=batch_sizes,
-        use_amp=args.use_amp,
-        amp_dtype=args.amp_dtype,
-        use_compile=args.use_compile,
-    )
+    # ─── 速度基准 ───
+    print(f"\n[2] 速度基准测试...")
+    total = payload["features"].size(0)
+    rng = np.random.default_rng(42)
+    stock_idx = rng.choice(total, size=min(args.num_stocks, total), replace=False).tolist()
 
-    # ─── Print Final Summary ───
-    print(f"\n{'='*70}")
-    print(f"FINAL BENCHMARK SUMMARY")
-    print(f"{'='*70}")
-    print(f"Device: {results['gpu_name']}")
-    print(f"Horizon: {args.horizon} steps")
-    print(f"{'─'*70}")
-    print(f"  {'Version':<35} {'Mean (ms)':>10} {'Speedup':>10}")
-    print(f"{'─'*70}")
+    bs_list = [1, 4, 8, 16, 32]
+    results = {}
+    for bs in bs_list:
+        if bs > len(stock_idx):
+            continue
+        b_idx = stock_idx[:bs]
+        b = prepare_inference_batch(payload, torch.tensor(b_idx, dtype=torch.long), device)
 
-    for ver_name, ver_data in results["versions"].items():
-        if ver_name == "v3_batch":
-            for sub_name, sub_data in sorted(ver_data.items()):
-                print(f"  {sub_name:<35} {sub_data['per_stock_mean_ms']:>10.2f} "
-                      f"{sub_data['speedup']:>9.2f}x")
-        elif "mean_ms" in ver_data:
-            print(f"  {ver_name:<35} {ver_data['mean_ms']:>10.2f} "
-                  f"{ver_data['speedup']:>9.2f}x")
+        for _ in range(3):
+            _ = v2_predict(model, tokenizer, b["features"], b["means"],
+                          b["stds"], b["time"], args.horizon, device)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
-    print(f"{'─'*70}")
+        times = []
+        for _ in range(10):
+            with Timer(sync_cuda=True) as t:
+                _ = v2_predict(model, tokenizer, b["features"], b["means"],
+                              b["stds"], b["time"], args.horizon, device)
+            times.append(t.ms)
 
-    # Find best
-    best_speedup = 1.0
-    best_name = "v0_baseline"
-    for ver_name, ver_data in results["versions"].items():
-        if ver_name == "v3_batch":
-            for sub_name, sub_data in ver_data.items():
-                if sub_data.get("speedup", 1.0) > best_speedup:
-                    best_speedup = sub_data["speedup"]
-                    best_name = sub_name
-        elif ver_data.get("speedup", 1.0) > best_speedup:
-            best_speedup = ver_data["speedup"]
-            best_name = ver_name
+        batch_ms = float(np.mean(times))
+        per_stock = batch_ms / bs
+        results[bs] = {"batch_ms": batch_ms, "per_stock_ms": per_stock}
 
-    print(f"\n  BEST: {best_name} — {best_speedup:.2f}x speedup")
+        if bs == 1:
+            baseline = per_stock
+
+        speedup = baseline / per_stock if baseline else 1.0
+        print(f"  bs={bs:2d}: {batch_ms:8.1f}ms total  {per_stock:6.1f}ms/stock  "
+              f"{speedup:5.2f}x  {1000/per_stock:.0f} stocks/s")
+
+    best_bs = min(results, key=lambda k: results[k]["per_stock_ms"])
+    best_ps = results[best_bs]["per_stock_ms"]
+    best_sp = baseline / best_ps
+    est_4000 = 4000 * best_ps / 1000
+    est_base = 4000 * baseline / 1000
+
+    print(f"\n  最佳: bs={best_bs}, {best_ps:.1f}ms/stock, {best_sp:.2f}x")
+    print(f"  4000 stocks: {est_4000:.0f}s (原版 {est_base:.0f}s, 节省 {est_base-est_4000:.0f}s)")
     report_memory(device)
 
-    # Save
+    # ─── 保存报告 ───
     os.makedirs(args.output_dir, exist_ok=True)
-    results_path = os.path.join(args.output_dir, "benchmark_results.json")
-    with open(results_path, "w") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
-    print(f"\nResults saved: {results_path}")
+    report = {
+        "device": str(device),
+        "gpu": torch.cuda.get_device_name(0),
+        "pytorch": torch.__version__,
+        "model_params": sum(p.numel() for p in model.parameters()),
+        "horizon": args.horizon,
+        "batch_size_results": {str(k): v for k, v in results.items()},
+        "best": {"batch_size": best_bs, "per_stock_ms": best_ps, "speedup": best_sp,
+                 "throughput": 1000 / best_ps, "est_4000_seconds": est_4000},
+    }
+    if args.verify:
+        report["quality"] = quality
 
-    if args.save_model and device.type == "cuda":
-        save_path = os.path.join(args.output_dir, "compiled_model.pt")
-        torch.save(compiled_model.state_dict(), save_path)
-        print(f"Compiled model saved: {save_path}")
-
-    return results
+    path = os.path.join(args.output_dir, "benchmark_report.json")
+    with open(path, "w") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    print(f"\n报告已保存: {path}")
 
 
 if __name__ == "__main__":
