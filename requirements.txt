@@ -1,0 +1,12 @@
+torch
+pandas
+numpy
+tqdm
+matplotlib
+fastapi
+uvicorn[standard]
+pydantic
+python-multipart
+httpx
+psutil
+optuna

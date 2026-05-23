@@ -1,0 +1,22 @@
+Kronos-R: A Reasoning Model for the Language of Financial Markets
+Copyright (c) 2025 Haofeng Guo
+
+This project is inspired by and extends Kronos 
+(https://github.com/shiyu-coder/Kronos) by Shi et al., 2025, 
+licensed under the MIT License.
+
+While the overall architecture has been significantly refactored for 
+reasoning-enhanced financial time series modeling, certain foundational 
+components (e.g., discretized tokenization pipeline) were originally 
+developed by the Kronos authors.
+
+Please cite the original Kronos paper:
+@misc{shi2025kronos,
+      title={Kronos: A Foundation Model for the Language of Financial Markets}, 
+      author={Yu Shi and Zongliang Fu and Shuo Chen and Bohan Zhao and Wei Xu and Changshui Zhang and Jian Li},
+      year={2025},
+      eprint={2508.02739},
+      archivePrefix={arXiv},
+      primaryClass={q-fin.ST},
+      url={https://arxiv.org/abs/2508.02739}, 
+}
