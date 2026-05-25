@@ -362,6 +362,70 @@ class PostTrainCIConfig:
     mape_eps = 1e-4
 
 
+class PostTrainStarCastConfig:
+    """Phase 8: STAR-CAST engine — online self-training with noisy exploration,
+    oracle filtering, and dual-engine (continuous + discrete) fine-tuning.
+
+    Core idea: at each training step, the model explores N parallel trajectories
+    with NEFTune noise + temperature sampling, the Oracle picks the best one
+    (correct direction + minimal path error), and the model is updated with:
+      1. Asymmetric direction-aware loss on continuous expected returns
+      2. STaR-style CE loss on discrete golden trajectories
+    """
+
+    random_seed = 42
+    deterministic = False
+    output_dir = "checkpoints/post_train_star_cast"
+    checkpoint_path = TrainingConfig.base_model_path
+    save_name = "star_cast.pt"
+    save_epoch_checkpoints = True
+
+    # ── Data (reuses Phase 6 rollout cache) ──
+    prefix_len = 1023
+    horizon = 10
+    stride_ratio = DataConfig.stride_ratio
+    cache_dir = "posttrain/rollout/cache"
+    cache_rebuild = False
+    max_stocks = 0
+    max_train_samples = 0
+    max_val_samples = 0
+
+    # ── Training schedule ──
+    epochs = 3
+    batch_size = 2
+    eval_batch_size = 8
+    accumulation_steps = 1
+    num_workers = 0
+    learning_rate = 2e-5
+    weight_decay = 1e-4
+    grad_clip = 0.5
+    max_train_updates = 0
+    progress_interval = 20
+
+    # ── STAR-CAST hyperparameters ──
+    neftune_alpha = 5.0             # NEFTune noise strength (0 to disable)
+    num_trajectories = 4            # N parallel exploration trajectories
+    exploration_temperature = 1.2   # temperature for exploration sampling
+    top_k_expected_return = 16      # Top-K for soft expected return computation
+    asymmetric_alpha = 3.0          # base penalty multiplier for wrong direction
+    asymmetric_beta = 10.0          # scale penalty for wrong direction magnitude
+    path_asymmetric_alpha = 4.0     # path-level base penalty (harsher)
+    path_asymmetric_beta = 15.0     # path-level scale penalty (harsher)
+    step_asym_weight = 1.0          # loss weight: step-level asymmetric
+    path_asym_weight = 1.5          # loss weight: path-level asymmetric
+    star_ce_weight = 0.5            # loss weight: STaR cross-entropy
+
+    # ── Optimisation ──
+    freeze_backbone = False
+    trainable_scope = "all"
+    use_gradient_checkpointing = True
+    use_amp = True
+    amp_dtype = "bfloat16"
+    use_tf32 = True
+
+    mape_eps = 1e-4
+
+
 def _apply_runtime_overrides():
     override_path = os.environ.get("KRONOS_OVERRIDE_JSON", "").strip()
     if not override_path:
@@ -383,6 +447,7 @@ def _apply_runtime_overrides():
         "PostTrainDAConfig": PostTrainDAConfig,
         "PostTrainRolloutConfig": PostTrainRolloutConfig,
         "PostTrainCIConfig": PostTrainCIConfig,
+        "PostTrainStarCastConfig": PostTrainStarCastConfig,
         "EvaluationConfig": EvaluationConfig,
         "PathConfig": PathConfig,
         "LoRAConfig": LoRAConfig,

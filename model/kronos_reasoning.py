@@ -1203,6 +1203,7 @@ class KronosReasoningGPT(nn.Module):
         return_attention=False,
         last_only=False,
         return_hidden=False,
+        neftune_alpha=0.0,
     ):
         _, seq_len = idx_coarse.shape
         if seq_len > self.max_len:
@@ -1213,6 +1214,14 @@ class KronosReasoningGPT(nn.Module):
         x = self._compute_embedding(
             idx_coarse, idx_fine, t_min, t_day, t_month, t_year
         )
+
+        # NEFTune: inject scaled uniform noise to embedding output
+        # Improves generalization for financial time-series by forcing the
+        # model to learn robust representations from noisy history.
+        if neftune_alpha > 0 and x.requires_grad:
+            B, L, D = x.shape
+            noise = (torch.rand_like(x) * 2 - 1) * (float(neftune_alpha) / math.sqrt(L * D))
+            x = x + noise
 
         attention_weights = []
         for block in self.blocks:
