@@ -1215,10 +1215,10 @@ class KronosReasoningGPT(nn.Module):
             idx_coarse, idx_fine, t_min, t_day, t_month, t_year
         )
 
-        # NEFTune: inject scaled uniform noise to embedding output
-        # Improves generalization for financial time-series by forcing the
-        # model to learn robust representations from noisy history.
-        if neftune_alpha > 0 and x.requires_grad:
+        # NEFTune: inject scaled uniform noise to embedding output.
+        # Applied whenever neftune_alpha > 0, regardless of grad mode —
+        # during STAR-CAST exploration (no_grad) we still want noisy embeddings.
+        if neftune_alpha > 0:
             B, L, D = x.shape
             noise = (torch.rand_like(x) * 2 - 1) * (float(neftune_alpha) / math.sqrt(L * D))
             x = x + noise
