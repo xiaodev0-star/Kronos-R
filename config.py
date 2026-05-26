@@ -396,24 +396,25 @@ class PostTrainStarCastConfig:
     eval_batch_size = 8
     accumulation_steps = 1
     num_workers = 0
-    learning_rate = 2e-5
+    learning_rate = 1.98e-5        # HPO best
     weight_decay = 1e-4
     grad_clip = 0.5
     max_train_updates = 0
     progress_interval = 20
+    checkpoint_interval = 120       # save every N updates (0 = epoch only)
 
-    # ── STAR-CAST hyperparameters ──
-    neftune_alpha = 5.0             # NEFTune noise strength (0 to disable)
-    num_trajectories = 4            # N parallel exploration trajectories
-    exploration_temperature = 1.2   # temperature for exploration sampling
-    top_k_expected_return = 16      # Top-K for soft expected return computation
-    asymmetric_alpha = 3.0          # base penalty multiplier for wrong direction
-    asymmetric_beta = 10.0          # scale penalty for wrong direction magnitude
-    path_asymmetric_alpha = 4.0     # path-level base penalty (harsher)
-    path_asymmetric_beta = 15.0     # path-level scale penalty (harsher)
-    step_asym_weight = 1.0          # loss weight: step-level asymmetric
-    path_asym_weight = 1.5          # loss weight: path-level asymmetric
-    star_ce_weight = 0.5            # loss weight: STaR cross-entropy
+    # ── STAR-CAST hyperparameters (Phase 8 HPO best: trial 13, path_mape=4.86%) ──
+    neftune_alpha = 5.78             # NEFTune noise strength
+    num_trajectories = 4             # N parallel exploration trajectories
+    exploration_temperature = 0.517  # temperature for exploration sampling
+    top_k_expected_return = 16       # Top-K for soft expected return computation
+    asymmetric_alpha = 3.0           # base penalty multiplier for wrong direction
+    asymmetric_beta = 10.0           # scale penalty for wrong direction magnitude
+    path_asymmetric_alpha = 4.0      # path-level base penalty (harsher) — not searched
+    path_asymmetric_beta = 15.0      # path-level scale penalty (harsher) — not searched
+    step_asym_weight = 1.0           # loss weight: step-level asymmetric
+    path_asym_weight = 1.5           # loss weight: path-level asymmetric
+    star_ce_weight = 0.174           # loss weight: STaR cross-entropy
 
     # ── Optimisation ──
     freeze_backbone = False

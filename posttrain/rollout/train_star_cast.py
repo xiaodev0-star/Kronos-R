@@ -443,6 +443,7 @@ def _build_arg_parser():
     parser.add_argument("--grad-clip", type=float, default=PostTrainStarCastConfig.grad_clip)
     parser.add_argument("--max-train-updates", type=int, default=PostTrainStarCastConfig.max_train_updates)
     parser.add_argument("--progress-interval", type=int, default=PostTrainStarCastConfig.progress_interval)
+    parser.add_argument("--checkpoint-interval", type=int, default=PostTrainStarCastConfig.checkpoint_interval)
 
     # STAR-CAST hyperparameters
     parser.add_argument("--neftune-alpha", type=float, default=PostTrainStarCastConfig.neftune_alpha)
@@ -493,6 +494,7 @@ def _namespace_from_args(args):
         grad_clip=float(args.grad_clip),
         max_train_updates=int(args.max_train_updates),
         progress_interval=max(1, int(args.progress_interval)),
+        checkpoint_interval=int(args.checkpoint_interval),
         neftune_alpha=float(args.neftune_alpha),
         num_trajectories=int(args.num_trajectories),
         exploration_temperature=float(args.exploration_temperature),
@@ -633,6 +635,15 @@ def train(cfg):
                 else:
                     cosine_sched.step()
                 updates += 1
+
+                # ── Step-interval checkpoint ──
+                ci = int(getattr(cfg, "checkpoint_interval", 0))
+                if ci > 0 and updates % ci == 0:
+                    step_path = os.path.join(
+                        cfg.output_dir,
+                        f"{os.path.splitext(cfg.save_name)[0]}-step{updates}.pt",
+                    )
+                    _save_star_cast_checkpoint(step_path, model, tokenizer, cfg, {"updates": updates}, history)
 
             for key in epoch_totals:
                 epoch_totals[key] += float(stats.get(key, 0.0))

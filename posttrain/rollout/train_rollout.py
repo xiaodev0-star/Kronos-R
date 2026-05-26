@@ -718,6 +718,19 @@ def compute_rollout_metrics(pred_returns, actual_returns, mape_eps=1e-4):
     overall["path_return_mape"] = path_metrics["return_mape"]
     overall["path_mae"] = path_metrics["mae"]
     overall["path_rmse"] = path_metrics["rmse"]
+
+    # Path DA: directional accuracy of the full 10-step trajectory
+    # Does the model correctly predict whether the price goes up or down
+    # over the entire horizon, compared to the starting point?
+    final_pred = pred_cum[:, -1]
+    final_actual = actual_cum[:, -1]
+    finite_pa = np.isfinite(final_pred) & np.isfinite(final_actual)
+    if finite_pa.sum() > 0:
+        path_pred_sign = np.where(final_pred[finite_pa] >= 0.0, 1, -1)
+        path_actual_sign = np.where(final_actual[finite_pa] >= 0.0, 1, -1)
+        overall["path_da"] = float(np.mean(path_pred_sign == path_actual_sign) * 100.0)
+    else:
+        overall["path_da"] = float("nan")
     per_step = []
     for step in range(pred.shape[1]):
         row = one(pred[:, step], actual[:, step])
