@@ -100,6 +100,12 @@ FIXED_PARAMS = {
     "path_asymmetric_beta": 15.0,
     "top_k_expected_return": 16,
     "epochs": 1,
+    # Phase 9 improvements: break the zero-collapse trap
+    "timidity_penalty_weight": 2.0,
+    "timidity_ratio_threshold": 0.5,
+    "oracle_magnitude_penalty": 2.0,
+    "prob_sharpening_temp": 0.5,
+    "actionable_da_threshold": 0.005,
 }
 
 
@@ -223,15 +229,22 @@ def _build_rollout_data(device, batch_size=None):
 # STAR-CAST Core: Differentiable Expected Returns & Asymmetric Loss
 # ═══════════════════════════════════════════════════════════════════════
 
-def _expected_return_from_topk(tokenizer, logits_c, logits_f, means, stds, top_k):
-    """Bridge discrete tokens to continuous expected returns via top-K soft expectation."""
+def _expected_return_from_topk(tokenizer, logits_c, logits_f, means, stds, top_k,
+                                sharpening_temp=1.0):
+    """Bridge discrete tokens to continuous expected returns via top-K soft expectation.
+
+    Probability sharpening (sharpening_temp < 1.0) forces the distribution to be
+    peakier, preventing the weighted average from collapsing to ~0 when the
+    distribution is flat (high entropy).
+    """
     B, H, V_c = logits_c.shape
     K = min(int(top_k), V_c)
 
     top_logits_c, top_idx_c = torch.topk(logits_c.float(), k=K, dim=-1)
     top_logits_f, top_idx_f = torch.topk(logits_f.float(), k=K, dim=-1)
-    prob_c = F.softmax(top_logits_c, dim=-1)
-    prob_f = F.softmax(top_logits_f, dim=-1)
+    # Temperature sharpening: lower temp -> sharper -> less averaging to zero
+    prob_c = F.softmax(top_logits_c / sharpening_temp, dim=-1)
+    prob_f = F.softmax(top_logits_f / sharpening_temp, dim=-1)
     prob_c = prob_c / prob_c.sum(dim=-1, keepdim=True).clamp_min(1e-8)
     prob_f = prob_f / prob_f.sum(dim=-1, keepdim=True).clamp_min(1e-8)
 
@@ -247,12 +260,25 @@ def _expected_return_from_topk(tokenizer, logits_c, logits_f, means, stds, top_k
     return (joint_prob * returns_grid).sum(dim=(-1, -2))  # [B, H]
 
 
-def _asymmetric_direction_loss(expected, actual, alpha, beta, eps=1e-4):
-    """Asymmetric penalty: wrong-direction errors are amplified."""
+def _asymmetric_direction_loss(expected, actual, alpha, beta, eps=1e-4,
+                                timidity_weight=2.0, timidity_ratio=0.5):
+    """Asymmetric penalty with push-forward for timid predictions.
+
+    - Wrong direction: amplified by (alpha + beta * |expected|)
+    - Correct but too conservative (|pred| < |actual| * timidity_ratio):
+      amplified by timidity_weight — breaks zero-collapse trap
+    """
     abs_err = torch.abs(expected - actual)
     is_wrong = ((expected * actual) < 0) & (torch.abs(actual) > eps)
+    # Push-forward: correct direction but magnitude < ratio * actual
+    is_correct_but_timid = (
+        ((expected * actual) > 0)
+        & (torch.abs(expected) < torch.abs(actual) * timidity_ratio)
+        & (torch.abs(actual) > eps)
+    )
     penalty = torch.ones_like(abs_err)
     penalty = torch.where(is_wrong, alpha + beta * torch.abs(expected), penalty)
+    penalty = torch.where(is_correct_but_timid, timidity_weight, penalty)
     return abs_err * penalty
 
 
@@ -266,6 +292,7 @@ def _star_cast_exploration(
     time_feats, means, stds, actual_returns,
     prefix_len, horizon, num_traj, temp, neftune_alpha,
     device, amp_enabled, amp_dtype, chunk_size=96,
+    oracle_magnitude_penalty=2.0,
 ):
     """Noisy exploration with CHUNKED forward passes.
 
@@ -340,11 +367,18 @@ def _star_cast_exploration(
     path_returns = traj_ret.sum(dim=2)                          # [B, N]
     actual_path = actual_returns[:, :H].sum(dim=1)              # [B]
 
-    # ── Vectorized Oracle Filter ──
+    # ── Vectorized Oracle Filter (with volatility-matching penalty) ──
     correct_dir = (path_returns * actual_path.unsqueeze(1)) > 0
     is_valid = correct_dir.any(dim=1) & (torch.abs(actual_path) > 1e-6)
 
     errors = torch.abs(path_returns - actual_path.unsqueeze(1))
+    # Volatility-matching penalty: penalize trajectories whose predicted
+    # magnitude is much smaller than the actual magnitude.
+    # This breaks the Oracle's preference for conservative near-zero predictions.
+    mag_penalty = torch.clamp(
+        torch.abs(actual_path.unsqueeze(1)) - torch.abs(path_returns), min=0,
+    )
+    errors = errors + oracle_magnitude_penalty * mag_penalty
     errors[~correct_dir] = float('inf')
     best_idx = errors.argmin(dim=1)
 
@@ -441,6 +475,7 @@ def _train_star_cast(model, tokenizer, params: dict, tdir: str, device) -> dict:
                 prefix_len, horizon,
                 p["num_trajectories"], p["exploration_temp"], p["neftune_alpha"],
                 device, use_amp, amp_dtype, chunk_size=SERVER_EXPLORE_CHUNK,
+                oracle_magnitude_penalty=p["oracle_magnitude_penalty"],
             )
 
             # ── Phase B: Dual-Engine Update ──
@@ -462,14 +497,17 @@ def _train_star_cast(model, tokenizer, params: dict, tdir: str, device) -> dict:
                 rollout_c = logits_c[:, start:start + horizon, :]
                 rollout_f = logits_f[:, start:start + horizon, :]
 
-                # Engine 1: Continuous — Asymmetric Direction Loss
+                # Engine 1: Continuous — Asymmetric Direction Loss (with push-forward)
                 expected = _expected_return_from_topk(
                     tokenizer, rollout_c, rollout_f, means, stds,
                     p["top_k_expected_return"],
+                    sharpening_temp=p["prob_sharpening_temp"],
                 )
 
                 step_loss = _asymmetric_direction_loss(
                     expected, actual_h, p["asymmetric_alpha"], p["asymmetric_beta"],
+                    timidity_weight=p["timidity_penalty_weight"],
+                    timidity_ratio=p["timidity_ratio_threshold"],
                 ).mean()
 
                 expected_path = torch.cumsum(expected, dim=1)
@@ -477,6 +515,8 @@ def _train_star_cast(model, tokenizer, params: dict, tdir: str, device) -> dict:
                 path_loss = _asymmetric_direction_loss(
                     expected_path, actual_path,
                     p["asymmetric_alpha"] * 1.3, p["path_asymmetric_beta"],
+                    timidity_weight=p["timidity_penalty_weight"],
+                    timidity_ratio=p["timidity_ratio_threshold"],
                 ).mean()
 
                 # Engine 2: Discrete — STaR CE Reinforcement
@@ -538,7 +578,8 @@ def _train_star_cast(model, tokenizer, params: dict, tdir: str, device) -> dict:
                os.path.join(tdir, "star_cast_model.pt"))
 
     # Evaluate
-    eval_result = _eval_rollout(model, tokenizer, val_loader, device)
+    eval_result = _eval_rollout(model, tokenizer, val_loader, device,
+                                actionable_da_threshold=p["actionable_da_threshold"])
     if os.path.exists(resume_path): os.remove(resume_path)
 
     result = {
@@ -556,17 +597,24 @@ def _train_star_cast(model, tokenizer, params: dict, tdir: str, device) -> dict:
 # ═══════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def _eval_rollout(model, tokenizer, val_loader, device, max_batches=None) -> dict:
-    """Strict 10-step autoregressive rollout -> path_mape, daily_mape, da.
+def _eval_rollout(model, tokenizer, val_loader, device, max_batches=None,
+                  actionable_da_threshold=0.005) -> dict:
+    """Strict 10-step autoregressive rollout -> path_mape, daily_mape, da, actionable_da.
+
+    actionable_da: DA computed only on predictions where |pred| > threshold,
+    measuring whether the model's "confident" calls are directionally accurate.
 
     Args:
         max_batches: override eval batch limit (None = use SERVER_EVAL_BATCHES).
                      Set lower (e.g. 80) for quick intermediate pruning checks.
+        actionable_da_threshold: minimum |pred| for a prediction to count as "actionable".
     """
     model.eval()
     all_path_mape = []
     all_daily_mape = []
     all_da = []
+    all_actionable_da = []
+    all_actionable_ratio = []  # fraction of predictions above threshold
     prefix_len = PREFIX_LEN
     horizon = ROLLOUT_HORIZON
     limit = max_batches if max_batches is not None else SERVER_EVAL_BATCHES
@@ -647,17 +695,37 @@ def _eval_rollout(model, tokenizer, val_loader, device, max_batches=None) -> dic
         actual_sign = (actual_rets >= 0).float() * 2 - 1
         all_da.append((pred_sign == actual_sign).float().mean().item() * 100)
 
+        # Actionable DA: only count predictions where model is "confident"
+        confident_mask = torch.abs(pred_rets) > actionable_da_threshold
+        if confident_mask.sum() > 0:
+            actionable_da_val = (
+                (pred_sign[confident_mask] == actual_sign[confident_mask])
+                .float().mean().item() * 100
+            )
+            all_actionable_da.append(actionable_da_val)
+            all_actionable_ratio.append(
+                confident_mask.float().mean().item() * 100
+            )
+
     if not all_path_mape:
         return {"path_mape": 999.0, "daily_mape": 999.0, "da": 0.0,
+                "actionable_da": 0.0, "actionable_ratio": 0.0,
                 "path_mape_std": 0.0, "num_eval_steps": 0}
 
-    return {
+    result = {
         "path_mape":      round(float(np.mean(all_path_mape)), 6),
         "daily_mape":     round(float(np.mean(all_daily_mape)), 6),
         "da":             round(float(np.mean(all_da)), 4),
         "path_mape_std":  round(float(np.std(all_path_mape)), 6),
         "num_eval_steps": len(all_path_mape),
     }
+    if all_actionable_da:
+        result["actionable_da"] = round(float(np.mean(all_actionable_da)), 4)
+        result["actionable_ratio"] = round(float(np.mean(all_actionable_ratio)), 4)
+    else:
+        result["actionable_da"] = 0.0
+        result["actionable_ratio"] = 0.0
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -776,6 +844,8 @@ def main():
         trial.set_user_attr("elapsed_min", round(elapsed / 60, 1))
         trial.set_user_attr("daily_mape", result["daily_mape"])
         trial.set_user_attr("da", result.get("da", 0))
+        trial.set_user_attr("actionable_da", result.get("actionable_da", 0))
+        trial.set_user_attr("actionable_ratio", result.get("actionable_ratio", 0))
         trial.set_user_attr("train_loss", result.get("train_loss", 0))
 
         study.tell(trial, path_mape)
@@ -784,7 +854,10 @@ def main():
         completed += 1
 
         print(f"  path_mape={path_mape:.4f}%  daily_mape={result['daily_mape']:.4f}%  "
-              f"da={result.get('da', 0):.2f}%  time={elapsed/60:.1f}min  "
+              f"da={result.get('da', 0):.2f}%  "
+              f"act_da={result.get('actionable_da', 0):.2f}% "
+              f"(ratio={result.get('actionable_ratio', 0):.1f}%)  "
+              f"time={elapsed/60:.1f}min  "
               f"[{completed}/{N_TRIALS}]")
         del model
         if device.type == "cuda": torch.cuda.empty_cache()

@@ -1,15 +1,10 @@
-"""Phase 8: STAR-CAST Post-Training HPO.
+"""Phase 8 V3: Improved STAR-CAST HPO — break the zero-collapse trap.
 
-Hyperparameter search for the STAR-CAST engine:
-  1. Noisy Exploration (NEFTune + temperature sampling)
-  2. Oracle Filter (select best trajectory by path return)
-  3. Dual-Engine Update (asymmetric continuous + STaR discrete)
-
-Searches the core hyperparameters that control the exploration/exploitation
-trade-off and the asymmetric direction penalty.
+Searches the 3 key improved-loss hyperparameters with cosine-annealing LR,
+fixed training steps, and 600 stocks for fast iteration.
 
 Usage:
-    python -m hpo.phase8_star_cast
+    python -m hpo.phase8_star_cast_v3
 """
 
 from __future__ import annotations
@@ -25,7 +20,6 @@ os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
 import numpy as np
 import optuna
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
@@ -44,12 +38,12 @@ from reproducibility import set_global_seed
 # ═══════════════════════════════════════════════════════════════════════
 # Config
 # ═══════════════════════════════════════════════════════════════════════
-N_TRIALS = 40
-STUDY_NAME = "phase8_star_cast"
-CLEAN_START = True
+N_TRIALS = 16
+STUDY_NAME = "phase8_star_cast_v3"
+CLEAN_START = False  # set True to wipe all trials
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PHASE8_DIR = os.path.join(PROJECT_ROOT, "trials", "phase8_star_cast")
+PHASE8_DIR = os.path.join(PROJECT_ROOT, "trials", "phase8_star_cast_v3")
 STUDY_DB = os.path.join(PHASE8_DIR, "study.db")
 SUMMARY_CSV = os.path.join(PHASE8_DIR, "summary.csv")
 TOKENIZER_PATH = os.path.join(PROJECT_ROOT, "checkpoints", "tokenizer.pt")
@@ -60,6 +54,7 @@ TOKENIZER_BITS = 10
 TOKENIZER_VOCAB = 1 << TOKENIZER_BITS
 PREFIX_LEN = 1023
 ROLLOUT_HORIZON = 10
+MAX_UPDATES = 200  # fixed
 
 # ── Fixed backbone (Phase 3 trial 047) ──
 BACKBONE = {
@@ -69,54 +64,48 @@ BACKBONE = {
     "dropout": 0.1323, "use_revin": False, "num_factor_tokens": 0,
 }
 
-# ── Server resource config (override via env vars) ──
-SERVER_BATCH_SIZE     = int(os.environ.get("STARCAST_BS",  "16"))
-SERVER_NUM_WORKERS    = int(os.environ.get("STARCAST_NW",  "4"))
-SERVER_EVAL_BATCHES   = int(os.environ.get("STARCAST_EVAL", "500"))
-SERVER_GRAD_ACCUM     = int(os.environ.get("STARCAST_GA",  "2"))
+# ── Resource config ──
+SERVER_BATCH_SIZE     = int(os.environ.get("STARCAST_BS",  "2"))
+SERVER_NUM_WORKERS    = int(os.environ.get("STARCAST_NW",  "0"))
+SERVER_EVAL_BATCHES   = int(os.environ.get("STARCAST_EVAL", "200"))
+SERVER_GRAD_ACCUM     = int(os.environ.get("STARCAST_GA",  "16"))
 SERVER_USE_COMPILE    = os.environ.get("STARCAST_COMPILE", "0") == "1"
-# Max sequences per forward during exploration (controls attention matrix size)
-# 4090 24G: 128 is safe (~1.2 GB attention), 192 borderline, 256+ OOM-risk
 SERVER_EXPLORE_CHUNK  = int(os.environ.get("STARCAST_CHUNK", "96"))
 
 # ═══════════════════════════════════════════════════════════════════════
-# Search space
+# Search space — only the 3 improved-loss knobs
 # ═══════════════════════════════════════════════════════════════════════
 SEARCH_SPACE = {
-    "exploration_temp":     (0.5, 3.0),        # temperature — controls trajectory diversity
-    "neftune_alpha":        (1.0, 8.0),        # NEFTune noise strength
-    "star_ce_weight":       (0.1, 2.0),        # STaR CE weight — discrete reinforcement
-    "lr":                   (1e-6, 2e-5),      # learning rate
-    "max_updates":          [80, 160],         # updates per trial (fast scan)
+    "timidity_penalty_weight":  (1.0, 4.0),     # push-forward magnitude
+    "oracle_magnitude_penalty": (1.0, 5.0),     # oracle volatility matching
+    "prob_sharpening_temp":     (0.2, 1.0),     # probability sharpening
 }
 
-# Fixed STAR-CAST parameters (not searched — narrowed to keep search tractable)
+# ── Fixed from Phase 8 V2 best ──
 FIXED_PARAMS = {
-    "num_trajectories": 4,                 # 4 trajectories (speed > marginal gain)
-    "step_asym_weight": 1.0,               # step-level asymmetric weight (fixed)
-    "path_asym_weight": 1.5,               # path-level asymmetric weight (fixed)
-    "asymmetric_alpha": 3.0,               # base direction penalty (fixed)
-    "asymmetric_beta": 10.0,               # magnitude penalty scaling (fixed)
-    "path_asymmetric_beta": 15.0,          # path-level magnitude penalty (fixed)
-    "top_k_expected_return": 16,           # Top-K for soft expected return
+    "num_trajectories": 4,
+    "exploration_temp": 0.414,          # V2 best
+    "neftune_alpha": 2.5,               # V2 best
+    "star_ce_weight": 0.334,            # V2 best
+    "lr": 9.59e-6,                      # V2 best
+    "step_asym_weight": 1.0,
+    "path_asym_weight": 1.5,
+    "asymmetric_alpha": 3.0,
+    "asymmetric_beta": 10.0,
+    "path_asymmetric_beta": 15.0,
+    "top_k_expected_return": 16,
+    "timidity_ratio_threshold": 0.5,    # fixed
+    "actionable_da_threshold": 0.005,   # fixed
     "epochs": 1,
-    # Phase 9 improvements: break the zero-collapse trap
-    "timidity_penalty_weight": 2.0,
-    "timidity_ratio_threshold": 0.5,
-    "oracle_magnitude_penalty": 2.0,
-    "prob_sharpening_temp": 0.5,
-    "actionable_da_threshold": 0.005,
+    "max_updates": MAX_UPDATES,
 }
 
 
 def sample_params(trial: optuna.Trial) -> dict:
-    """Sample STAR-CAST hyperparameters from the search space."""
     p = {}
-    p["exploration_temp"]  = round(trial.suggest_float("exploration_temp", *SEARCH_SPACE["exploration_temp"], log=True), 4)
-    p["neftune_alpha"]     = round(trial.suggest_float("neftune_alpha", *SEARCH_SPACE["neftune_alpha"], log=True), 2)
-    p["star_ce_weight"]    = round(trial.suggest_float("star_ce_weight", *SEARCH_SPACE["star_ce_weight"], log=True), 4)
-    p["lr"]                = round(trial.suggest_float("lr", *SEARCH_SPACE["lr"], log=True), 10)
-    p["max_updates"]       = trial.suggest_categorical("max_updates", SEARCH_SPACE["max_updates"])
+    p["timidity_penalty_weight"]  = round(trial.suggest_float("timidity_penalty_weight",  *SEARCH_SPACE["timidity_penalty_weight"],  log=True), 2)
+    p["oracle_magnitude_penalty"] = round(trial.suggest_float("oracle_magnitude_penalty", *SEARCH_SPACE["oracle_magnitude_penalty"], log=True), 2)
+    p["prob_sharpening_temp"]     = round(trial.suggest_float("prob_sharpening_temp",     *SEARCH_SPACE["prob_sharpening_temp"],     log=True), 3)
     p.update(FIXED_PARAMS)
     return p
 
@@ -126,12 +115,6 @@ def sample_params(trial: optuna.Trial) -> dict:
 # ═══════════════════════════════════════════════════════════════════════
 
 def _make_rollout_cfg():
-    """Minimal config namespace for RolloutWindowDataset.
-
-    Uses a fixed random subset of HPO_STOCKS stocks (default 600) for
-    fast HPO iteration. The random seed ensures reproducibility across trials.
-    Set STARCAST_STOCKS=0 env var to use all stocks.
-    """
     n_stocks = int(os.environ.get("STARCAST_STOCKS", "600"))
     return Namespace(
         prefix_len=PREFIX_LEN, horizon=ROLLOUT_HORIZON,
@@ -186,9 +169,6 @@ def _load_basemodel(device):
         ckpt = torch.load(BASEMODEL_PATH, map_location=device, weights_only=False)
         sd = ckpt.get("model_state_dict", ckpt)
         model.load_state_dict(sd, strict=False)
-        print(f"  Loaded BaseModel from {BASEMODEL_PATH}")
-    else:
-        print(f"  WARNING: {BASEMODEL_PATH} not found. Using random init.")
     model.eval()
     return model
 
@@ -198,22 +178,20 @@ def _load_basemodel(device):
 # ═══════════════════════════════════════════════════════════════════════
 
 def _build_rollout_data(device, batch_size=None):
-    """Build train/val DataLoaders with server-configured parallelism."""
     if batch_size is None:
         batch_size = SERVER_BATCH_SIZE
     cfg = _make_rollout_cfg()
     train_ds = RolloutWindowDataset("train", cfg=cfg, max_samples=0, seed=42)
     val_ds   = RolloutWindowDataset("val",   cfg=cfg, max_samples=0, seed=59)
-    print(f"  Rollout train windows: {len(train_ds)}, val windows: {len(val_ds)}")
-    print(f"  batch_size={batch_size}, num_workers={SERVER_NUM_WORKERS}, "
-          f"grad_accum={SERVER_GRAD_ACCUM}")
+    print(f"  Train windows={len(train_ds)}, val windows={len(val_ds)}")
 
     loader_kwargs = dict(
         num_workers=SERVER_NUM_WORKERS,
         pin_memory=(device.type == "cuda"),
-        persistent_workers=(SERVER_NUM_WORKERS > 0),
-        prefetch_factor=2,
     )
+    if SERVER_NUM_WORKERS > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 2
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
         collate_fn=rollout_collate, **loader_kwargs,
@@ -226,29 +204,23 @@ def _build_rollout_data(device, batch_size=None):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# STAR-CAST Core: Differentiable Expected Returns & Asymmetric Loss
+# Improved STAR-CAST Core
 # ═══════════════════════════════════════════════════════════════════════
 
 def _expected_return_from_topk(tokenizer, logits_c, logits_f, means, stds, top_k,
                                 sharpening_temp=1.0):
-    """Bridge discrete tokens to continuous expected returns via top-K soft expectation.
-
-    Probability sharpening (sharpening_temp < 1.0) forces the distribution to be
-    peakier, preventing the weighted average from collapsing to ~0 when the
-    distribution is flat (high entropy).
-    """
+    """Top-K soft expected returns with probability sharpening."""
     B, H, V_c = logits_c.shape
     K = min(int(top_k), V_c)
 
     top_logits_c, top_idx_c = torch.topk(logits_c.float(), k=K, dim=-1)
     top_logits_f, top_idx_f = torch.topk(logits_f.float(), k=K, dim=-1)
-    # Temperature sharpening: lower temp -> sharper -> less averaging to zero
     prob_c = F.softmax(top_logits_c / sharpening_temp, dim=-1)
     prob_f = F.softmax(top_logits_f / sharpening_temp, dim=-1)
     prob_c = prob_c / prob_c.sum(dim=-1, keepdim=True).clamp_min(1e-8)
     prob_f = prob_f / prob_f.sum(dim=-1, keepdim=True).clamp_min(1e-8)
 
-    joint_prob = prob_c.unsqueeze(-1) * prob_f.unsqueeze(-2)  # [B, H, K, K]
+    joint_prob = prob_c.unsqueeze(-1) * prob_f.unsqueeze(-2)
     pair_c = top_idx_c.unsqueeze(-1).expand(B, H, K, K).reshape(B * H, K * K)
     pair_f = top_idx_f.unsqueeze(-2).expand(B, H, K, K).reshape(B * H, K * K)
 
@@ -257,20 +229,14 @@ def _expected_return_from_topk(tokenizer, logits_c, logits_f, means, stds, top_k
         decoded = decoded.view(B, H, K, K)
         returns_grid = decoded * stds[:, 0].view(B, 1, 1, 1) + means[:, 0].view(B, 1, 1, 1)
 
-    return (joint_prob * returns_grid).sum(dim=(-1, -2))  # [B, H]
+    return (joint_prob * returns_grid).sum(dim=(-1, -2))
 
 
 def _asymmetric_direction_loss(expected, actual, alpha, beta, eps=1e-4,
                                 timidity_weight=2.0, timidity_ratio=0.5):
-    """Asymmetric penalty with push-forward for timid predictions.
-
-    - Wrong direction: amplified by (alpha + beta * |expected|)
-    - Correct but too conservative (|pred| < |actual| * timidity_ratio):
-      amplified by timidity_weight — breaks zero-collapse trap
-    """
+    """Asymmetric penalty with push-forward for timid predictions."""
     abs_err = torch.abs(expected - actual)
     is_wrong = ((expected * actual) < 0) & (torch.abs(actual) > eps)
-    # Push-forward: correct direction but magnitude < ratio * actual
     is_correct_but_timid = (
         ((expected * actual) > 0)
         & (torch.abs(expected) < torch.abs(actual) * timidity_ratio)
@@ -283,7 +249,7 @@ def _asymmetric_direction_loss(expected, actual, alpha, beta, eps=1e-4,
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# STAR-CAST: Noisy Exploration + Oracle Filter (Phase A, no grad)
+# STAR-CAST: Noisy Exploration + Oracle Filter
 # ═══════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
@@ -294,44 +260,27 @@ def _star_cast_exploration(
     device, amp_enabled, amp_dtype, chunk_size=96,
     oracle_magnitude_penalty=2.0,
 ):
-    """Noisy exploration with CHUNKED forward passes.
-
-    Instead of feeding all B*N trajectories through the model at once
-    (which creates enormous attention matrices), we split into chunks.
-    Each chunk is processed independently; results are reassembled.
-
-    Oracle Filter is fully vectorized across the batch dimension.
-    """
     B = idx_c_full.size(0)
     N = num_traj
     H = horizon
     BN = B * N
     CS = min(chunk_size, BN)
 
-    # ── Per-sample trajectory context ──
-    # Store as [B, N, prefix_len+H] and reshape to [B*N, ...] chunk-by-chunk
     traj_c = torch.empty(B, N, prefix_len + H, dtype=torch.long, device=device)
     traj_f = torch.empty(B, N, prefix_len + H, dtype=torch.long, device=device)
     traj_ret = torch.empty(B, N, H, device=device, dtype=torch.float32)
 
-    # Initial context: [B, N, prefix_len]
     traj_c[:, :, :prefix_len] = idx_c_full[:, :prefix_len].unsqueeze(1).expand(B, N, prefix_len)
     traj_f[:, :, :prefix_len] = idx_f_full[:, :prefix_len].unsqueeze(1).expand(B, N, prefix_len)
 
-    means_3d = means.unsqueeze(1).expand(B, N, means.size(1))  # [B, N, 6]
-    stds_3d  = stds.unsqueeze(1).expand(B, N, stds.size(1))
-
-    # ── Autoregressive rollout, chunked per step ──
     for step in range(H):
         cur_len = prefix_len + step
         cur_c = traj_c[:, :, :cur_len].reshape(BN, cur_len)
         cur_f = traj_f[:, :, :cur_len].reshape(BN, cur_len)
 
-        # Build time features for current length
         cur_time_all = {k: time_feats[k][:, :cur_len].unsqueeze(1).expand(B, N, cur_len).reshape(BN, cur_len)
                         for k in ("minute", "day", "month", "year")}
 
-        # ── Chunked forward ──
         logits_c_chunks, logits_f_chunks = [], []
         for chunk_start in range(0, BN, CS):
             chunk_end = min(chunk_start + CS, BN)
@@ -344,49 +293,38 @@ def _star_cast_exploration(
             logits_c_chunks.append(lc[:, -1, :].float())
             logits_f_chunks.append(lf[:, -1, :].float())
 
-        logits_c_all = torch.cat(logits_c_chunks, dim=0)  # [BN, V]
+        logits_c_all = torch.cat(logits_c_chunks, dim=0)
         logits_f_all = torch.cat(logits_f_chunks, dim=0)
 
-        # Temperature sampling (all trajectories at once, cheap)
         probs_c = F.softmax(logits_c_all / max(1e-4, temp), dim=-1)
         probs_f = F.softmax(logits_f_all / max(1e-4, temp), dim=-1)
-        pred_c = torch.multinomial(probs_c, num_samples=1)  # [BN, 1]
+        pred_c = torch.multinomial(probs_c, num_samples=1)
         pred_f = torch.multinomial(probs_f, num_samples=1)
 
-        # Decode + compute returns
-        decoded = tokenizer.decode(pred_c, pred_f)[..., 0].float()  # [BN, 1]
+        decoded = tokenizer.decode(pred_c, pred_f)[..., 0].float()
         step_ret = decoded * stds.unsqueeze(1).expand(B, N, 6).reshape(BN, 6)[:, 0:1] \
                    + means.unsqueeze(1).expand(B, N, 6).reshape(BN, 6)[:, 0:1]
         traj_ret[:, :, step] = step_ret.view(B, N)
-
-        # Append to trajectories
         traj_c[:, :, cur_len] = pred_c.view(B, N)
         traj_f[:, :, cur_len] = pred_f.view(B, N)
 
-    # ── Reshape for Oracle Filter ──
-    path_returns = traj_ret.sum(dim=2)                          # [B, N]
-    actual_path = actual_returns[:, :H].sum(dim=1)              # [B]
+    path_returns = traj_ret.sum(dim=2)
+    actual_path = actual_returns[:, :H].sum(dim=1)
 
-    # ── Vectorized Oracle Filter (with volatility-matching penalty) ──
+    # Oracle filter with volatility-matching penalty
     correct_dir = (path_returns * actual_path.unsqueeze(1)) > 0
     is_valid = correct_dir.any(dim=1) & (torch.abs(actual_path) > 1e-6)
 
     errors = torch.abs(path_returns - actual_path.unsqueeze(1))
-    # Volatility-matching penalty: penalize trajectories whose predicted
-    # magnitude is much smaller than the actual magnitude.
-    mag_penalty = torch.clamp(
-        torch.abs(actual_path.unsqueeze(1)) - torch.abs(path_returns), min=0,
-    )
+    mag_penalty = torch.clamp(torch.abs(actual_path.unsqueeze(1)) - torch.abs(path_returns), min=0)
     errors = errors + oracle_magnitude_penalty * mag_penalty
     errors[~correct_dir] = float('inf')
     best_idx = errors.argmin(dim=1)
 
-    # Gather best trajectory per sample
     gather_idx = best_idx.view(B, 1, 1).expand(B, 1, prefix_len + H)
     golden_c = traj_c.gather(1, gather_idx).squeeze(1)
     golden_f = traj_f.gather(1, gather_idx).squeeze(1)
 
-    # Fallback to ground truth where no valid golden trajectory
     gt_c = idx_c_full[:, :prefix_len + H]
     gt_f = idx_f_full[:, :prefix_len + H]
     mask = is_valid.view(B, 1).float()
@@ -397,11 +335,10 @@ def _star_cast_exploration(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# STAR-CAST Training
+# Training
 # ═══════════════════════════════════════════════════════════════════════
 
 def _train_star_cast(model, tokenizer, params: dict, tdir: str, device) -> dict:
-    """STAR-CAST training loop with gradient accumulation. Returns best val path_mape."""
     p = params
     result_path = os.path.join(tdir, "result.json")
     resume_path = os.path.join(tdir, "star_cast_resume.pt")
@@ -421,15 +358,22 @@ def _train_star_cast(model, tokenizer, params: dict, tdir: str, device) -> dict:
     use_amp = device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
 
-    # torch.compile for server GPU (2x speedup on forward pass)
-    _compiled = False
     if SERVER_USE_COMPILE and hasattr(torch, "compile"):
         try:
             model = torch.compile(model, mode="reduce-overhead")
-            _compiled = True
-            print("  torch.compile enabled (reduce-overhead)")
+            print("  torch.compile enabled")
         except Exception as e:
-            print(f"  torch.compile failed ({e}), using eager mode")
+            print(f"  torch.compile failed ({e})")
+
+    # ── Cosine annealing with warmup ──
+    warmup_steps = max(2, max_updates // 10)  # 10% warmup
+    cosine_t_max = max_updates - warmup_steps
+    warmup_sched = torch.optim.lr_scheduler.LinearLR(
+        opt, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps,
+    )
+    cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=max(1, cosine_t_max), eta_min=lr * 0.05,
+    )
 
     # Resume
     update_count = 0
@@ -438,7 +382,7 @@ def _train_star_cast(model, tokenizer, params: dict, tdir: str, device) -> dict:
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
         opt.load_state_dict(ckpt["optimizer_state_dict"])
         update_count = ckpt["update_count"]
-        print(f"  Resume from update {update_count}")
+        print(f"  RESUME from update {update_count}")
 
     prefix_len = PREFIX_LEN
     horizon = ROLLOUT_HORIZON
@@ -446,7 +390,7 @@ def _train_star_cast(model, tokenizer, params: dict, tdir: str, device) -> dict:
     total_loss_sum = 0.0
 
     model.train()
-    pbar = tqdm(total=max_updates - update_count, desc="  STAR-CAST train")
+    pbar = tqdm(total=max_updates - update_count, desc="  STAR-CAST")
     opt.zero_grad(set_to_none=True)
     microbatch_count = 0
 
@@ -467,7 +411,7 @@ def _train_star_cast(model, tokenizer, params: dict, tdir: str, device) -> dict:
             idx_c_full, idx_f_full = tokenizer.encode(feats)
             actual_h = actual[:, :horizon]
 
-            # ── Phase A: Noisy Exploration + Oracle Filter ──
+            # Phase A: Exploration
             golden_c, golden_f, has_golden = _star_cast_exploration(
                 model, tokenizer, idx_c_full, idx_f_full,
                 times, means, stds, actual,
@@ -477,7 +421,7 @@ def _train_star_cast(model, tokenizer, params: dict, tdir: str, device) -> dict:
                 oracle_magnitude_penalty=p["oracle_magnitude_penalty"],
             )
 
-            # ── Phase B: Dual-Engine Update ──
+            # Phase B: Dual-Engine Update
             model.train()
             train_len = golden_c.size(1)
             train_time = {k: v[:, :train_len] for k, v in times.items()}
@@ -496,7 +440,6 @@ def _train_star_cast(model, tokenizer, params: dict, tdir: str, device) -> dict:
                 rollout_c = logits_c[:, start:start + horizon, :]
                 rollout_f = logits_f[:, start:start + horizon, :]
 
-                # Engine 1: Continuous — Asymmetric Direction Loss (with push-forward)
                 expected = _expected_return_from_topk(
                     tokenizer, rollout_c, rollout_f, means, stds,
                     p["top_k_expected_return"],
@@ -518,7 +461,6 @@ def _train_star_cast(model, tokenizer, params: dict, tdir: str, device) -> dict:
                     timidity_ratio=p["timidity_ratio_threshold"],
                 ).mean()
 
-                # Engine 2: Discrete — STaR CE Reinforcement
                 if has_golden.any():
                     target_c = golden_c[has_golden, prefix_len:prefix_len + horizon]
                     target_f = golden_f[has_golden, prefix_len:prefix_len + horizon]
@@ -537,8 +479,6 @@ def _train_star_cast(model, tokenizer, params: dict, tdir: str, device) -> dict:
                 loss = (p["step_asym_weight"] * step_loss +
                         p["path_asym_weight"] * path_loss +
                         p["star_ce_weight"] * star_ce)
-
-                # Scale loss by gradient accumulation steps
                 loss = loss / ga_steps
 
             if not torch.isfinite(loss): continue
@@ -546,12 +486,17 @@ def _train_star_cast(model, tokenizer, params: dict, tdir: str, device) -> dict:
             scaler.scale(loss).backward()
             microbatch_count += 1
 
-            # Step optimizer only after accumulating enough gradients
             if microbatch_count % ga_steps == 0:
                 scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 0.3)
                 scaler.step(opt); scaler.update()
                 opt.zero_grad(set_to_none=True)
+
+                # LR schedule
+                if total_updates_done < warmup_steps:
+                    warmup_sched.step()
+                else:
+                    cosine_sched.step()
 
                 total_loss_sum += loss.item() * ga_steps
                 total_updates_done += 1
@@ -559,9 +504,11 @@ def _train_star_cast(model, tokenizer, params: dict, tdir: str, device) -> dict:
                 pbar.set_postfix({
                     "loss": f"{loss.item() * ga_steps:.3f}",
                     "golden": f"{has_golden.float().mean().item():.2f}",
+                    "lr": f"{opt.param_groups[0]['lr']:.2e}",
                 })
 
-            if total_updates_done % 80 == 0 and total_updates_done > 0:
+            # Save resume checkpoint every 60 updates
+            if total_updates_done % 60 == 0 and total_updates_done > 0:
                 torch.save({
                     "update_count": total_updates_done,
                     "model_state_dict": model.state_dict(),
@@ -592,34 +539,21 @@ def _train_star_cast(model, tokenizer, params: dict, tdir: str, device) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# True 10-step AR evaluation
+# Evaluation with Actionable DA
 # ═══════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
 def _eval_rollout(model, tokenizer, val_loader, device, max_batches=None,
                   actionable_da_threshold=0.005) -> dict:
-    """Strict 10-step autoregressive rollout -> path_mape, daily_mape, da, actionable_da.
-
-    actionable_da: DA computed only on predictions where |pred| > threshold,
-    measuring whether the model's "confident" calls are directionally accurate.
-
-    Args:
-        max_batches: override eval batch limit (None = use SERVER_EVAL_BATCHES).
-                     Set lower (e.g. 80) for quick intermediate pruning checks.
-        actionable_da_threshold: minimum |pred| for a prediction to count as "actionable".
-    """
     model.eval()
-    all_path_mape = []
-    all_daily_mape = []
-    all_da = []
-    all_actionable_da = []
-    all_actionable_ratio = []  # fraction of predictions above threshold
+    all_path_mape, all_daily_mape, all_da = [], [], []
+    all_actionable_da, all_actionable_ratio = [], []
     prefix_len = PREFIX_LEN
     horizon = ROLLOUT_HORIZON
     limit = max_batches if max_batches is not None else SERVER_EVAL_BATCHES
 
     n_batches = 0
-    for batch in tqdm(val_loader, desc="  Eval AR10", leave=False):
+    for batch in tqdm(val_loader, desc="  Eval", leave=False):
         feats  = batch["features"].to(device=device, dtype=torch.float32)
         means  = batch["means"].to(device=device, dtype=torch.float32)
         stds   = batch["stds"].to(device=device, dtype=torch.float32)
@@ -665,9 +599,9 @@ def _eval_rollout(model, tokenizer, val_loader, device, max_batches=None,
 
         if len(pred_rets) < horizon: continue
 
-        pred_rets = torch.stack(pred_rets, dim=1)  # [B, 10]
+        pred_rets = torch.stack(pred_rets, dim=1)
 
-        # Path MAPE
+        # Path MAPE & Daily MAPE
         cum_pred   = torch.cumsum(pred_rets.float(), dim=1)
         cum_actual = torch.cumsum(actual_rets.float(), dim=1)
         for step in range(horizon):
@@ -694,7 +628,7 @@ def _eval_rollout(model, tokenizer, val_loader, device, max_batches=None,
         actual_sign = (actual_rets >= 0).float() * 2 - 1
         all_da.append((pred_sign == actual_sign).float().mean().item() * 100)
 
-        # Actionable DA: only count predictions where model is "confident"
+        # Actionable DA
         confident_mask = torch.abs(pred_rets) > actionable_da_threshold
         if confident_mask.sum() > 0:
             actionable_da_val = (
@@ -702,9 +636,7 @@ def _eval_rollout(model, tokenizer, val_loader, device, max_batches=None,
                 .float().mean().item() * 100
             )
             all_actionable_da.append(actionable_da_val)
-            all_actionable_ratio.append(
-                confident_mask.float().mean().item() * 100
-            )
+            all_actionable_ratio.append(confident_mask.float().mean().item() * 100)
 
     if not all_path_mape:
         return {"path_mape": 999.0, "daily_mape": 999.0, "da": 0.0,
@@ -712,11 +644,11 @@ def _eval_rollout(model, tokenizer, val_loader, device, max_batches=None,
                 "path_mape_std": 0.0, "num_eval_steps": 0}
 
     result = {
-        "path_mape":      round(float(np.mean(all_path_mape)), 6),
-        "daily_mape":     round(float(np.mean(all_daily_mape)), 6),
-        "da":             round(float(np.mean(all_da)), 4),
-        "path_mape_std":  round(float(np.std(all_path_mape)), 6),
-        "num_eval_steps": len(all_path_mape),
+        "path_mape":       round(float(np.mean(all_path_mape)), 6),
+        "daily_mape":      round(float(np.mean(all_daily_mape)), 6),
+        "da":              round(float(np.mean(all_da)), 4),
+        "path_mape_std":   round(float(np.std(all_path_mape)), 6),
+        "num_eval_steps":  len(all_path_mape),
     }
     if all_actionable_da:
         result["actionable_da"] = round(float(np.mean(all_actionable_da)), 4)
@@ -728,13 +660,14 @@ def _eval_rollout(model, tokenizer, val_loader, device, max_batches=None,
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Trial directory management
+# Trial management
 # ═══════════════════════════════════════════════════════════════════════
 
 def _assign_trial_dir():
     os.makedirs(PHASE8_DIR, exist_ok=True)
     counter_path = os.path.join(PHASE8_DIR, ".next_trial")
 
+    # First check for incomplete (resumable) trials
     existing = sorted([d for d in os.listdir(PHASE8_DIR)
                        if d.startswith("trial_") and os.path.isdir(os.path.join(PHASE8_DIR, d))],
                       key=lambda x: int(x.split("_")[1]))
@@ -765,25 +698,22 @@ def main():
     os.makedirs(PHASE8_DIR, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Phase 8 — STAR-CAST Post-Training HPO")
+    print(f"Phase 8 V3 — Improved STAR-CAST HPO (break zero-collapse)")
     print(f"  Output: {PHASE8_DIR}")
     print(f"  Trials: {N_TRIALS}")
     print(f"  Device: {device}")
     if device.type == "cuda":
-        print(f"  GPU:    {torch.cuda.get_device_name(0)}")
+        print(f"  GPU:    {torch.cuda.get_device_name(0)} ({torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB)")
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("high")
-    print(f"  Prefix: {PREFIX_LEN}, Horizon: {ROLLOUT_HORIZON}")
-    print(f"  Server config: batch_size={SERVER_BATCH_SIZE}, workers={SERVER_NUM_WORKERS}, "
-          f"grad_accum={SERVER_GRAD_ACCUM}, eval_batches={SERVER_EVAL_BATCHES}, "
-          f"compile={SERVER_USE_COMPILE}, explore_chunk={SERVER_EXPLORE_CHUNK}, "
-          f"stocks={os.environ.get('STARCAST_STOCKS', '600')}")
-    print(f"  Search space: {list(SEARCH_SPACE.keys())}")
-    print(f"  Fixed params: {list(FIXED_PARAMS.keys())}")
+    print(f"  Max_updates: {MAX_UPDATES}, GA={SERVER_GRAD_ACCUM}, BS={SERVER_BATCH_SIZE}")
+    print(f"  LR schedule: warmup(10%) + cosine annealing to 5%")
+    print(f"  Search: {list(SEARCH_SPACE.keys())}")
+    print(f"  Fixed: expl_temp={FIXED_PARAMS['exploration_temp']}, neftune={FIXED_PARAMS['neftune_alpha']}, "
+          f"ce_w={FIXED_PARAMS['star_ce_weight']}, lr={FIXED_PARAMS['lr']:.1e}")
     print()
 
-    # Load tokenizer + BaseModel once
     print("Loading tokenizer + BaseModel...")
     tokenizer = _load_tokenizer(device)
     base_model = _load_basemodel(device)
@@ -798,7 +728,17 @@ def main():
     seen_hashes = set()
     completed = 0
 
+    start_time = time.time()
+    deadline = start_time + 4 * 3600  # 4 hours
+
     while completed < N_TRIALS:
+        # Check time budget
+        elapsed = time.time() - start_time
+        remaining = deadline - time.time()
+        if remaining < 1800:  # less than 30 min left
+            print(f"\n[Time budget] {elapsed/3600:.1f}h elapsed, {remaining/60:.0f}min remaining — stopping new trials")
+            break
+
         trial = study.ask()
         tdir = _assign_trial_dir()
         os.makedirs(tdir, exist_ok=True)
@@ -816,14 +756,15 @@ def main():
             study.tell(trial, state=optuna.trial.TrialState.PRUNED)
             continue
 
-        print(f"\n{'='*60}")
+        print(f"\n{'='*70}")
         print(f"Trial {trial.number:03d} (dir={os.path.basename(tdir)})")
-        print(f"Params: temp={params['exploration_temp']} neftune={params['neftune_alpha']} "
-              f"ce_w={params['star_ce_weight']} lr={params['lr']:.1e} "
-              f"updates={params['max_updates']}")
-        print(f"{'='*60}")
+        print(f"  timidity_w={params['timidity_penalty_weight']}  "
+              f"oracle_mag={params['oracle_magnitude_penalty']}  "
+              f"sharpening={params['prob_sharpening_temp']}")
+        print(f"  fixed: temp={params['exploration_temp']} neftune={params['neftune_alpha']} "
+              f"ce_w={params['star_ce_weight']} lr={params['lr']:.1e} updates={params['max_updates']}")
+        print(f"{'='*70}")
 
-        # Clone model for this trial
         model = copy.deepcopy(base_model)
 
         t0 = time.time()
@@ -836,11 +777,12 @@ def main():
             study.tell(trial, state=optuna.trial.TrialState.FAIL)
             continue
 
-        elapsed = time.time() - t0
+        elapsed_trial = time.time() - t0
+        elapsed_total = time.time() - start_time
 
         trial.set_user_attr("trial_dir", tdir)
         trial.set_user_attr("dir_name", os.path.basename(tdir))
-        trial.set_user_attr("elapsed_min", round(elapsed / 60, 1))
+        trial.set_user_attr("elapsed_min", round(elapsed_trial / 60, 1))
         trial.set_user_attr("daily_mape", result["daily_mape"])
         trial.set_user_attr("da", result.get("da", 0))
         trial.set_user_attr("actionable_da", result.get("actionable_da", 0))
@@ -855,20 +797,35 @@ def main():
         print(f"  path_mape={path_mape:.4f}%  daily_mape={result['daily_mape']:.4f}%  "
               f"da={result.get('da', 0):.2f}%  "
               f"act_da={result.get('actionable_da', 0):.2f}% "
-              f"(ratio={result.get('actionable_ratio', 0):.1f}%)  "
-              f"time={elapsed/60:.1f}min  "
+              f"(ratio={result.get('actionable_ratio', 0):.1f}%)")
+        print(f"  Trial time: {elapsed_trial/60:.1f}min  "
+              f"Total: {elapsed_total/3600:.1f}h  "
+              f"Remaining: {(deadline - time.time())/3600:.1f}h  "
               f"[{completed}/{N_TRIALS}]")
+
         del model
         if device.type == "cuda": torch.cuda.empty_cache()
 
-    # Summary
+        # Save intermediate summary after each trial
+        export_summary(study)
+
+    # Final summary
+    print(f"\n{'='*70}")
+    print(f"HPO complete. Total time: {(time.time() - start_time)/3600:.1f}h, trials: {completed}")
     export_summary(study)
-    if len(study.trials) > 0 and any(t.state == optuna.trial.TrialState.COMPLETE for t in study.trials):
-        best = study.best_trial
-        print(f"\nPhase 8 complete. Best path_mape: {best.value:.4f}% (trial {best.number})")
-        print(f"Best params: {best.params}")
-    else:
-        print(f"\nPhase 8 complete. No successful trials.")
+    if len(study.trials) > 0:
+        completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+        if completed_trials:
+            best = study.best_trial
+            print(f"\nBest path_mape: {best.value:.4f}% (trial {best.number})")
+            print(f"Best params: timidity_w={best.params.get('timidity_penalty_weight','?')}  "
+                  f"oracle_mag={best.params.get('oracle_magnitude_penalty','?')}  "
+                  f"sharpening={best.params.get('prob_sharpening_temp','?')}")
+            ba = best.user_attrs
+            print(f"  da={ba.get('da','?')}%  actionable_da={ba.get('actionable_da','?')}%  "
+                  f"actionable_ratio={ba.get('actionable_ratio','?')}%")
+        else:
+            print("\nNo successful trials.")
 
 
 def export_summary(study: optuna.Study):
@@ -888,13 +845,14 @@ def export_summary(study: optuna.Study):
         w = csv.DictWriter(f, fieldnames=ordered, extrasaction="ignore")
         w.writeheader(); w.writerows(rows)
     ranked = sorted(rows, key=lambda r: r["value"])
-    print(f"\nTop-10 by path_mape:")
-    for r in ranked[:10]:
-        print(f"  Trial {r['trial']:03d}  path_mape={r['value']:.4f}  "
-              f"temp={r.get('exploration_temp','?')}  "
-              f"neftune={r.get('neftune_alpha','?')}  "
-              f"lr={r.get('lr','?'):.1e}  ce_w={r.get('star_ce_weight','?')}")
-    print(f"Summary: {SUMMARY_CSV}")
+    print(f"\n  Top-5 by path_mape:")
+    for r in ranked[:5]:
+        print(f"    Trial {r['trial']:03d}  path_mape={r['value']:.4f}  "
+              f"timidity_w={r.get('timidity_penalty_weight','?')}  "
+              f"oracle_mag={r.get('oracle_magnitude_penalty','?')}  "
+              f"sharpening={r.get('prob_sharpening_temp','?')}  "
+              f"act_da={r.get('actionable_da','?')}  "
+              f"act_ratio={r.get('actionable_ratio','?')}")
 
 
 if __name__ == "__main__":

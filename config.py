@@ -416,6 +416,13 @@ class PostTrainStarCastConfig:
     path_asym_weight = 1.5           # loss weight: path-level asymmetric
     star_ce_weight = 0.174           # loss weight: STaR cross-entropy
 
+    # ── Phase 9 improvements: break the zero-collapse trap ──
+    timidity_penalty_weight = 2.0    # penalize correct-direction-but-too-conservative preds (push-forward)
+    timidity_ratio_threshold = 0.5   # threshold: |pred| < |actual| * this -> timid
+    oracle_magnitude_penalty = 2.0   # penalize low-volatility trajectories in Oracle filtering
+    prob_sharpening_temp = 0.5       # temperature for probability sharpening (<1.0 = sharper)
+    actionable_da_threshold = 0.005  # threshold for "actionable" DA (only count |pred| > threshold)
+
     # ── Optimisation ──
     freeze_backbone = False
     trainable_scope = "all"

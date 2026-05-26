@@ -96,14 +96,20 @@ def inject_neftune_noise(hidden_states, noise_alpha=5.0):
 # Module 2: Differentiable Expected Returns & Asymmetric Direction Loss
 # ═══════════════════════════════════════════════════════════════════════
 
-def get_differentiable_expected_returns(tokenizer, logits_c, logits_f, means, stds, top_k=16):
+def get_differentiable_expected_returns(tokenizer, logits_c, logits_f, means, stds, top_k=16,
+                                         sharpening_temp=1.0):
     """Bridge the discrete-token to continuous-return gradient gap.
 
     Computes the fully-differentiable expected log-return at each step by:
       1. Taking top-K coarse and fine tokens
-      2. Computing joint (coarse, fine) probabilities
+      2. Computing joint (coarse, fine) probabilities (with optional sharpening)
       3. Decoding all K*K pairs to continuous returns
       4. Computing the probability-weighted expected return
+
+    Probability sharpening (sharpening_temp < 1.0) forces the token distribution
+    to be sharper/peakier, preventing the weighted average from collapsing to ~0
+    when the distribution is flat (high entropy). This ensures the expected return
+    reflects the model's true top-1 intent.
 
     Args:
         tokenizer: HierarchicalQuantizer with decode(idx_c, idx_f) -> [B, N, 6]
@@ -112,6 +118,7 @@ def get_differentiable_expected_returns(tokenizer, logits_c, logits_f, means, st
         means: [B, 6] per-feature means from prefix normalization
         stds:  [B, 6] per-feature stds from prefix normalization
         top_k: number of top tokens to consider
+        sharpening_temp: temperature for softmax (< 1.0 = sharper, 1.0 = unchanged)
 
     Returns:
         expected_returns: [B, H] soft expected log-return at each step
@@ -122,8 +129,9 @@ def get_differentiable_expected_returns(tokenizer, logits_c, logits_f, means, st
     top_logits_c, top_idx_c = torch.topk(logits_c.float(), k=K, dim=-1)  # [B, H, K]
     top_logits_f, top_idx_f = torch.topk(logits_f.float(), k=K, dim=-1)
 
-    prob_c = F.softmax(top_logits_c, dim=-1)  # [B, H, K]
-    prob_f = F.softmax(top_logits_f, dim=-1)
+    # Temperature sharpening: lower temp -> sharper distribution -> less averaging to 0
+    prob_c = F.softmax(top_logits_c / sharpening_temp, dim=-1)  # [B, H, K]
+    prob_f = F.softmax(top_logits_f / sharpening_temp, dim=-1)
     prob_c = prob_c / prob_c.sum(dim=-1, keepdim=True).clamp_min(1e-8)
     prob_f = prob_f / prob_f.sum(dim=-1, keepdim=True).clamp_min(1e-8)
 
@@ -142,12 +150,19 @@ def get_differentiable_expected_returns(tokenizer, logits_c, logits_f, means, st
     return expected_returns
 
 
-def compute_asymmetric_direction_loss(expected_returns, actual_returns, eps=1e-4, alpha=3.0, beta=10.0):
-    """Asymmetric direction-aware penalty.
+def compute_asymmetric_direction_loss(expected_returns, actual_returns, eps=1e-4,
+                                       alpha=3.0, beta=10.0, timidity_weight=2.0,
+                                       timidity_ratio=0.5):
+    """Asymmetric direction-aware penalty with push-forward for timid predictions.
 
-    - Correct direction & small error: low penalty (weight ~1.0)
-    - Wrong direction: penalty amplified by (alpha + beta * |expected_return|)
-    - Severely wrong (large magnitude in wrong direction): devastating penalty
+    Three penalty regimes:
+      - Wrong direction: amplified by (alpha + beta * |expected|) — devastating
+      - Correct direction but too conservative (|pred| < |actual| * timidity_ratio):
+        amplified by timidity_weight — forces model to commit to larger magnitudes
+      - Correct direction & adequate magnitude: weight ~1.0 (standard L1)
+
+    The push-forward penalty breaks the "zero-collapse" trap where the model
+    learns to predict ~0 to avoid triggering the asymmetric wrong-direction penalty.
 
     Args:
         expected_returns: [B, H] model's expected log-returns
@@ -155,6 +170,8 @@ def compute_asymmetric_direction_loss(expected_returns, actual_returns, eps=1e-4
         eps: threshold for "flat/directional" classification
         alpha: base penalty multiplier for wrong direction
         beta: magnitude-scaled penalty for wrong direction
+        timidity_weight: penalty multiplier for correct-but-timid predictions
+        timidity_ratio: threshold ratio — |pred| < |actual| * ratio counts as timid
 
     Returns:
         per_step_loss: [B, H] weighted absolute error per step
@@ -164,11 +181,18 @@ def compute_asymmetric_direction_loss(expected_returns, actual_returns, eps=1e-4
 
     is_directional = torch.abs(actual_returns) > eps
     is_wrong_direction = (direction_product < 0) & is_directional
+    # Push-forward: correct direction but predicted magnitude < ratio * actual
+    is_correct_but_timid = (
+        (direction_product > 0)
+        & (torch.abs(expected_returns) < torch.abs(actual_returns) * timidity_ratio)
+        & is_directional
+    )
 
-    # Dynamic penalty: default 1.0, amplified for wrong direction
+    # Dynamic penalty: default 1.0, amplified for wrong direction or timidity
     penalty_weight = torch.ones_like(abs_error)
     wrong_penalty = alpha + beta * torch.abs(expected_returns)
     penalty_weight = torch.where(is_wrong_direction, wrong_penalty, penalty_weight)
+    penalty_weight = torch.where(is_correct_but_timid, timidity_weight, penalty_weight)
 
     return abs_error * penalty_weight
 
@@ -277,7 +301,17 @@ def _star_cast_exploration(
 
         if is_correct_dir.any() and abs(real_total) > float(cfg.mape_eps):
             valid_indices = torch.where(is_correct_dir)[0]
+            # Base error: absolute path-return error
             errors = torch.abs(path_ret_b[valid_indices] - real_total)
+            # Volatility-matching penalty: penalize trajectories whose predicted
+            # magnitude is much smaller than the actual magnitude.
+            # This breaks the Oracle's preference for conservative near-zero predictions
+            # and encourages selection of trajectories with realistic volatility.
+            mag_penalty = torch.clamp(
+                torch.abs(torch.tensor(real_total, device=path_ret_b.device))
+                - torch.abs(path_ret_b[valid_indices]), min=0,
+            )
+            errors = errors + float(cfg.oracle_magnitude_penalty) * mag_penalty
             best_idx = valid_indices[errors.argmin()]
 
             best_paths_c_list.append(context_c_reshaped[b, best_idx])
@@ -356,21 +390,26 @@ def train_star_cast_step(model, tokenizer, batch, cfg, device, amp_enabled, amp_
         tokenizer, rollout_c, rollout_f,
         batch["means"], batch["stds"],
         top_k=int(cfg.top_k_expected_return),
+        sharpening_temp=float(cfg.prob_sharpening_temp),
     )
 
-    # Step-level asymmetric loss
+    # Step-level asymmetric loss (with push-forward)
     step_loss_matrix = compute_asymmetric_direction_loss(
         expected_traj, actual_returns_h,
         alpha=float(cfg.asymmetric_alpha), beta=float(cfg.asymmetric_beta),
+        timidity_weight=float(cfg.timidity_penalty_weight),
+        timidity_ratio=float(cfg.timidity_ratio_threshold),
     )
     step_asym_loss = step_loss_matrix.mean()
 
-    # Path-level asymmetric loss (cumulative returns)
+    # Path-level asymmetric loss (cumulative returns, with push-forward)
     expected_path = torch.cumsum(expected_traj, dim=1)
     actual_path = torch.cumsum(actual_returns_h, dim=1)
     path_loss_matrix = compute_asymmetric_direction_loss(
         expected_path, actual_path,
         alpha=float(cfg.path_asymmetric_alpha), beta=float(cfg.path_asymmetric_beta),
+        timidity_weight=float(cfg.timidity_penalty_weight),
+        timidity_ratio=float(cfg.timidity_ratio_threshold),
     )
     path_asym_loss = path_loss_matrix.mean()
 
@@ -457,6 +496,11 @@ def _build_arg_parser():
     parser.add_argument("--step-asym-weight", type=float, default=PostTrainStarCastConfig.step_asym_weight)
     parser.add_argument("--path-asym-weight", type=float, default=PostTrainStarCastConfig.path_asym_weight)
     parser.add_argument("--star-ce-weight", type=float, default=PostTrainStarCastConfig.star_ce_weight)
+    parser.add_argument("--timidity-penalty-weight", type=float, default=PostTrainStarCastConfig.timidity_penalty_weight)
+    parser.add_argument("--timidity-ratio-threshold", type=float, default=PostTrainStarCastConfig.timidity_ratio_threshold)
+    parser.add_argument("--oracle-magnitude-penalty", type=float, default=PostTrainStarCastConfig.oracle_magnitude_penalty)
+    parser.add_argument("--prob-sharpening-temp", type=float, default=PostTrainStarCastConfig.prob_sharpening_temp)
+    parser.add_argument("--actionable-da-threshold", type=float, default=PostTrainStarCastConfig.actionable_da_threshold)
 
     parser.add_argument("--freeze-backbone", type=_as_bool, default=PostTrainStarCastConfig.freeze_backbone)
     parser.add_argument("--trainable-scope", choices=["all", "heads"], default=PostTrainStarCastConfig.trainable_scope)
@@ -506,6 +550,11 @@ def _namespace_from_args(args):
         step_asym_weight=float(args.step_asym_weight),
         path_asym_weight=float(args.path_asym_weight),
         star_ce_weight=float(args.star_ce_weight),
+        timidity_penalty_weight=float(args.timidity_penalty_weight),
+        timidity_ratio_threshold=float(args.timidity_ratio_threshold),
+        oracle_magnitude_penalty=float(args.oracle_magnitude_penalty),
+        prob_sharpening_temp=float(args.prob_sharpening_temp),
+        actionable_da_threshold=float(args.actionable_da_threshold),
         freeze_backbone=bool(args.freeze_backbone),
         trainable_scope=str(args.trainable_scope),
         use_gradient_checkpointing=bool(args.use_gradient_checkpointing),
