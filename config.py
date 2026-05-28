@@ -423,6 +423,12 @@ class PostTrainStarCastConfig:
     prob_sharpening_temp = 0.5       # temperature for probability sharpening (<1.0 = sharper)
     actionable_da_threshold = 0.005  # threshold for "actionable" DA (only count |pred| > threshold)
 
+    # ── Phase 8-2: Direction-Explicit classification (Engine 3) ──
+    direction_weight = 0.3              # loss weight for direction CE (0.0 = disable/backward-compat)
+    direction_epsilon_scale = 0.5       # adaptive epsilon = mean(|returns|) * scale (up/down/flat)
+    direction_ce_flat_weight = 0.3      # CE class weight for FLAT — prevents model always predicting flat
+    direction_use_class_weights = True  # apply class-balancing [1.0, flat_w, 1.0] in direction CE
+
     # ── Optimisation ──
     freeze_backbone = False
     trainable_scope = "all"
@@ -434,6 +440,100 @@ class PostTrainStarCastConfig:
     mape_eps = 1e-4
 
 
+class PostTrainStarCastV5Config:
+    """Phase 9 STAR-CAST v5 config — breaks the zero-collapse trap.
+
+    Key changes from Phase 8 PostTrainStarCastConfig:
+      1. Magnitude-anchored asymmetric loss (fixes root causes 2+3)
+      2. KL anchor to frozen base model (fixes root cause 4 partial)
+      3. Oracle N=8 with improved scoring (fixes root cause 1 partial)
+      4. top_k=32 for expected returns (reduces probability cancellation)
+      5. All params unified (fixes root cause 5)
+      6. Full direction logging (fixes root cause 6)
+    """
+
+    random_seed = 42
+    deterministic = False
+    output_dir = "checkpoints/post_train_star_cast_v5"
+    checkpoint_path = TrainingConfig.base_model_path
+    save_name = "star_cast_v5.pt"
+    save_epoch_checkpoints = True
+
+    # ── Data ──
+    prefix_len = 1023
+    horizon = 10
+    stride_ratio = DataConfig.stride_ratio
+    cache_dir = "posttrain/rollout/cache"
+    cache_rebuild = False
+    max_stocks = 0
+    max_train_samples = 0
+    max_val_samples = 0
+
+    # ── Training schedule ──
+    epochs = 3
+    batch_size = 2
+    eval_batch_size = 8
+    accumulation_steps = 1
+    num_workers = 0
+    learning_rate = 1.5e-5
+    weight_decay = 1e-4
+    grad_clip = 0.5
+    max_train_updates = 0
+    progress_interval = 20
+    checkpoint_interval = 120
+
+    # ── STAR-CAST hyperparameters ──
+    neftune_alpha = 5.78
+    num_trajectories = 8
+    exploration_temperature = 0.5
+    top_k_expected_return = 32
+
+    # ── Asymmetric loss (Phase 8 base) ──
+    asymmetric_alpha = 3.0
+    asymmetric_beta = 10.0
+    path_asymmetric_alpha = 4.0
+    path_asymmetric_beta = 15.0
+    step_asym_weight = 1.0
+    path_asym_weight = 1.5
+    star_ce_weight = 0.174
+
+    # ── Phase 9 NEW: Magnitude-Anchored Loss (root cause 2+3 fix) ──
+    magnitude_anchor_gamma = 5.0      # anchors wrong_penalty to gamma*|actual| when expected~0
+    magnitude_floor = 0.005           # explicit penalty for predictions below this magnitude
+    magnitude_floor_weight = 100.0    # scaling factor for magnitude floor penalty
+
+    # ── Phase 9 NEW: Dynamic timidity (replaces static timidity_weight) ──
+    dynamic_timidity_alpha = 3.0      # base timidity penalty
+    dynamic_timidity_gamma = 5.0      # scales with conservatism ratio
+
+    # ── Legacy timidity (used by Oracle only, not loss) ──
+    timidity_penalty_weight = 2.0
+    timidity_ratio_threshold = 0.5
+    oracle_magnitude_penalty = 2.0
+    prob_sharpening_temp = 0.5
+    actionable_da_threshold = 0.005
+
+    # ── Phase 9 NEW: KL Anchor (root cause 4 partial fix) ──
+    kl_weight = 0.05
+
+    # ── Direction classification (Engine 3) ──
+    direction_weight = 0.3
+    direction_epsilon_scale = 0.3
+    direction_ce_flat_weight = 0.3
+    direction_use_class_weights = True
+
+    # ── Oracle scoring weights ──
+    oracle_score_magnitude_weight = 0.3
+
+    # ── Optimisation ──
+    freeze_backbone = False
+    trainable_scope = "all"
+    use_gradient_checkpointing = True
+    use_amp = True
+    amp_dtype = "bfloat16"
+    use_tf32 = True
+
+    mape_eps = 1e-4
 def _apply_runtime_overrides():
     override_path = os.environ.get("KRONOS_OVERRIDE_JSON", "").strip()
     if not override_path:
@@ -456,6 +556,7 @@ def _apply_runtime_overrides():
         "PostTrainRolloutConfig": PostTrainRolloutConfig,
         "PostTrainCIConfig": PostTrainCIConfig,
         "PostTrainStarCastConfig": PostTrainStarCastConfig,
+        "PostTrainStarCastV5Config": PostTrainStarCastV5Config,
         "EvaluationConfig": EvaluationConfig,
         "PathConfig": PathConfig,
         "LoRAConfig": LoRAConfig,

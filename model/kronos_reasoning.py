@@ -1192,6 +1192,37 @@ class KronosReasoningGPT(nn.Module):
             direction_state = last_hidden
         return self.direction_head(direction_state)
 
+    def compute_direction_logits_at_positions(self, x, latent_states, start=0, end=-1):
+        """Compute 3-class direction logits at arbitrary position range.
+
+        Phase 8-2: Enables per-step direction classification during STAR-CAST
+        training. Unlike _compute_direction_logits (last-only), this handles
+        arbitrary [start:end) slices for multi-step simultaneous training.
+
+        Args:
+            x: [B, S, dim] hidden states from _run_post_backbone
+            latent_states: [L, B, N, dim] latent reasoner states, or None
+            start: first position index (default 0)
+            end: last position index (default -1 means seq_len)
+
+        Returns:
+            dir_logits: [B, H, 3] where H = end - start
+        """
+        if end < 0:
+            end = x.size(1) + end + 1  # -1 -> seq_len
+        h = x[:, start:end, :]  # [B, H, dim]
+        B, H, D = h.shape
+
+        if latent_states is not None and latent_states.ndim == 4:
+            latent_mean = latent_states[-1].mean(dim=1)  # [B, D]
+            direction_state = h + latent_mean.unsqueeze(1)  # [B, H, D]
+        else:
+            direction_state = h
+
+        flat = direction_state.reshape(B * H, D)
+        logits = self.direction_head(flat)  # [B*H, 3]
+        return logits.view(B, H, 3)
+
     def forward(
         self,
         idx_coarse,

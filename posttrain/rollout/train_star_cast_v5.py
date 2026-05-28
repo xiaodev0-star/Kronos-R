@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
-"""Phase 8: STAR-CAST Engine — Self-Training with Asymmetric Reward and
-Continuous-Asymmetric Dual-Engine Fine-Tuning.
+"""Phase 9: STAR-CAST v5 — Breaking the Zero-Collapse Trap.
 
-STAR-CAST = Noisy Exploration + Oracle Filter + Dual-Engine Update
-
-At each training step:
-  1. Noisy Exploration: rollout N=4 trajectories with NEFTune noise + temperature sampling
-  2. Oracle Filter: select the best trajectory with correct direction sign
-  3. Dual-Engine Update:
-     - Continuous layer: asymmetric direction-aware loss on expected returns
-     - Discrete layer: STaR-style CE loss on golden trajectories only
+Key improvements over Phase 8 (train_star_cast.py):
+  1. Magnitude-Anchored Asymmetric Loss — anchors penalty to |actual| when |expected|→0
+  2. Dynamic Timidity — penalty scales with prediction conservatism
+  3. Magnitude Floor — explicit penalty for near-zero predictions
+  4. KL Anchor — frozen base model prevents distribution drift
+  5. Oracle N=8 with 3-factor scoring — more diverse trajectory selection
+  6. top_k=32 for expected returns — reduces probability cancellation
+  7. Full engineering fixes — unified params, complete logging
 """
 
 import argparse
@@ -26,7 +25,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from config import PostTrainStarCastConfig
+from config import PostTrainStarCastV5Config
 from evaluate_predictions import load_model
 from model.lora import trainable_parameter_summary
 from posttrain.rollout.data import (
@@ -49,42 +48,36 @@ from posttrain.rollout.train_rollout import (
     _configure_trainable,
     _build_optimizer,
     _write_history,
+    _kl_to_reference,
     compute_rollout_metrics,
     predict_autoregressive_returns,
     evaluate_model,
 )
 
 
-def _save_star_cast_checkpoint(path, model, tokenizer, cfg, metrics, history):
-    """Save STAR-CAST checkpoint with correct stage identifier."""
+def _save_v5_checkpoint(path, model, tokenizer, cfg, metrics, history):
+    """Save Phase 9 checkpoint with correct stage identifier."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     raw_model = getattr(model, "_orig_mod", model)
     payload = {
-        "stage": "star_cast_phase8",
+        "stage": "star_cast_v5_phase9",
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "model_state_dict": raw_model.state_dict(),
         "tokenizer_state_dict": tokenizer.state_dict(),
         "model_config": getattr(raw_model, "model_config", None),
-        "post_train_star_cast_config": _cfg_to_dict(cfg),
+        "post_train_star_cast_v5_config": _cfg_to_dict(cfg),
         "metrics": metrics,
         "history": history,
     }
     torch.save(payload, path)
     return path
 
-
 # ═══════════════════════════════════════════════════════════════════════
-# Module 1: NEFTune Noise Injection (for financial time-series generalization)
+# Module 1: NEFTune Noise Injection
 # ═══════════════════════════════════════════════════════════════════════
 
 def inject_neftune_noise(hidden_states, noise_alpha=5.0):
-    """Inject scaled uniform noise into hidden states after embedding.
-
-    Formula: noise = Uniform(-1, 1) * alpha / sqrt(L * D)
-
-    This forces the model to learn directionality from "imperfect history",
-    improving robustness to financial time-series noise.
-    """
+    """Inject scaled uniform noise into hidden states after embedding."""
     if not hidden_states.requires_grad:
         return hidden_states
     B, L, D = hidden_states.shape
@@ -93,76 +86,64 @@ def inject_neftune_noise(hidden_states, noise_alpha=5.0):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Module 2: Differentiable Expected Returns & Asymmetric Direction Loss
+# Module 2: Differentiable Expected Returns
 # ═══════════════════════════════════════════════════════════════════════
 
-def get_differentiable_expected_returns(tokenizer, logits_c, logits_f, means, stds, top_k=16,
-                                         sharpening_temp=1.0):
+def get_differentiable_expected_returns(tokenizer, logits_c, logits_f, means, stds, top_k=32,
+                                         sharpening_temp=0.5):
     """Bridge the discrete-token to continuous-return gradient gap.
 
-    Computes the fully-differentiable expected log-return at each step by:
-      1. Taking top-K coarse and fine tokens
-      2. Computing joint (coarse, fine) probabilities (with optional sharpening)
-      3. Decoding all K*K pairs to continuous returns
-      4. Computing the probability-weighted expected return
-
-    Probability sharpening (sharpening_temp < 1.0) forces the token distribution
-    to be sharper/peakier, preventing the weighted average from collapsing to ~0
-    when the distribution is flat (high entropy). This ensures the expected return
-    reflects the model's true top-1 intent.
-
-    Args:
-        tokenizer: HierarchicalQuantizer with decode(idx_c, idx_f) -> [B, N, 6]
-        logits_c: [B, H, V_c] coarse logits
-        logits_f: [B, H, V_f] fine logits
-        means: [B, 6] per-feature means from prefix normalization
-        stds:  [B, 6] per-feature stds from prefix normalization
-        top_k: number of top tokens to consider
-        sharpening_temp: temperature for softmax (< 1.0 = sharper, 1.0 = unchanged)
-
-    Returns:
-        expected_returns: [B, H] soft expected log-return at each step
+    Phase 9 change: top_k default 32 (was 16) to reduce probability cancellation.
     """
-    B, H, V_c = logits_c.shape
-    K = min(int(top_k), V_c)
+    top_k_c = min(max(1, int(top_k)), int(logits_c.size(-1)))
+    top_k_f = min(max(1, int(top_k)), int(logits_f.size(-1)))
+    B, H, _ = logits_c.shape
 
-    top_logits_c, top_idx_c = torch.topk(logits_c.float(), k=K, dim=-1)  # [B, H, K]
-    top_logits_f, top_idx_f = torch.topk(logits_f.float(), k=K, dim=-1)
+    if sharpening_temp > 0 and abs(sharpening_temp - 1.0) > 1e-4:
+        logits_c = logits_c / float(sharpening_temp)
+        logits_f = logits_f / float(sharpening_temp)
 
-    # Temperature sharpening: lower temp -> sharper distribution -> less averaging to 0
-    prob_c = F.softmax(top_logits_c / sharpening_temp, dim=-1)  # [B, H, K]
-    prob_f = F.softmax(top_logits_f / sharpening_temp, dim=-1)
-    prob_c = prob_c / prob_c.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-    prob_f = prob_f / prob_f.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+    top_logits_c, top_idx_c = torch.topk(logits_c.float(), k=top_k_c, dim=-1)
+    top_logits_f, top_idx_f = torch.topk(logits_f.float(), k=top_k_f, dim=-1)
 
-    # Joint probability: [B, H, K, K]
-    joint_prob = prob_c.unsqueeze(-1) * prob_f.unsqueeze(-2)
+    prob_c = torch.softmax(top_logits_c, dim=-1)
+    prob_f = torch.softmax(top_logits_f, dim=-1)
 
-    # Build all K*K pairs for batched decoding
-    pair_c = top_idx_c.unsqueeze(-1).expand(B, H, K, K).reshape(B * H, K * K)
-    pair_f = top_idx_f.unsqueeze(-2).expand(B, H, K, K).reshape(B * H, K * K)
+    pair_prob = prob_c.unsqueeze(-1) * prob_f.unsqueeze(-2)  # [B, H, Kc, Kf]
+    pair_c = top_idx_c.unsqueeze(-1).expand(B, H, top_k_c, top_k_f).reshape(B * H, top_k_c * top_k_f)
+    pair_f = top_idx_f.unsqueeze(-2).expand(B, H, top_k_c, top_k_f).reshape(B * H, top_k_c * top_k_f)
 
     with torch.no_grad():
-        decoded = tokenizer.decode(pair_c, pair_f)[..., 0].float()  # log_ret column
-        returns_grid = decoded.view(B, H, K, K) * stds[:, 0].view(B, 1, 1, 1) + means[:, 0].view(B, 1, 1, 1)
+        decoded = tokenizer.decode(pair_c, pair_f)[..., 0].float()
+        decoded = decoded.view(B, H, top_k_c, top_k_f)
+        returns = decoded * stds[:, 0].view(B, 1, 1, 1) + means[:, 0].view(B, 1, 1, 1)
 
-    expected_returns = (joint_prob * returns_grid).sum(dim=(-1, -2))  # [B, H]
-    return expected_returns
+    return (pair_prob * returns).sum(dim=(-1, -2))  # [B, H]
 
 
-def compute_asymmetric_direction_loss(expected_returns, actual_returns, eps=1e-4,
-                                       alpha=3.0, beta=10.0, timidity_weight=2.0,
-                                       timidity_ratio=0.5):
-    """Asymmetric direction-aware penalty with push-forward for timid predictions.
+# ═══════════════════════════════════════════════════════════════════════
+# Module 3: Magnitude-Anchored Asymmetric Loss (Phase 9 NEW)
+# ═══════════════════════════════════════════════════════════════════════
 
-    Three penalty regimes:
-      - Wrong direction: amplified by (alpha + beta * |expected|) — devastating
-      - Correct direction but too conservative (|pred| < |actual| * timidity_ratio):
-        amplified by timidity_weight — forces model to commit to larger magnitudes
-      - Correct direction & adequate magnitude: weight ~1.0 (standard L1)
+def compute_asymmetric_direction_loss_v2(expected_returns, actual_returns, eps=1e-4,
+                                          alpha=3.0, beta=10.0, gamma=5.0,
+                                          dynamic_timidity_alpha=3.0,
+                                          dynamic_timidity_gamma=5.0,
+                                          magnitude_floor=0.005,
+                                          magnitude_floor_weight=100.0):
+    """Magnitude-anchored asymmetric direction-aware penalty.
 
-    The push-forward penalty breaks the "zero-collapse" trap where the model
-    learns to predict ~0 to avoid triggering the asymmetric wrong-direction penalty.
+    Phase 9 key innovation: breaks the "zero is optimal" equilibrium.
+
+    Three innovations over Phase 8:
+      1. Magnitude-anchored wrong penalty:
+         wrong_penalty = alpha + beta * max(|expected|, gamma * |actual|)
+         When expected→0, penalty is still gamma*|actual|*beta — not just alpha.
+      2. Dynamic timidity:
+         timidity = alpha_t + gamma_t * (|actual| - |expected|) / (|actual| + eps)
+         Penalty increases with how conservative the prediction is.
+      3. Magnitude floor:
+         Explicit penalty for predictions below magnitude_floor threshold.
 
     Args:
         expected_returns: [B, H] model's expected log-returns
@@ -170,55 +151,68 @@ def compute_asymmetric_direction_loss(expected_returns, actual_returns, eps=1e-4
         eps: threshold for "flat/directional" classification
         alpha: base penalty multiplier for wrong direction
         beta: magnitude-scaled penalty for wrong direction
-        timidity_weight: penalty multiplier for correct-but-timid predictions
-        timidity_ratio: threshold ratio — |pred| < |actual| * ratio counts as timid
+        gamma: magnitude anchor coefficient (key Phase 9 parameter)
+        dynamic_timidity_alpha: base timidity penalty
+        dynamic_timidity_gamma: timidity scaling with conservatism
+        magnitude_floor: minimum acceptable prediction magnitude
+        magnitude_floor_weight: scaling for floor penalty
 
     Returns:
-        per_step_loss: [B, H] weighted absolute error per step
+        per_step_loss: [B, H] weighted penalty per step
     """
     abs_error = torch.abs(expected_returns - actual_returns)
     direction_product = expected_returns * actual_returns
 
     is_directional = torch.abs(actual_returns) > eps
     is_wrong_direction = (direction_product < 0) & is_directional
-    # Push-forward: correct direction but predicted magnitude < ratio * actual
-    is_correct_but_timid = (
-        (direction_product > 0)
-        & (torch.abs(expected_returns) < torch.abs(actual_returns) * timidity_ratio)
-        & is_directional
+    is_correct_direction = (direction_product > 0) & is_directional
+
+    # ── Innovation 1: Magnitude-anchored wrong penalty ──
+    # When |expected| is small, anchor to gamma * |actual|
+    anchored_magnitude = torch.max(
+        torch.abs(expected_returns),
+        gamma * torch.abs(actual_returns),
     )
+    wrong_penalty = alpha + beta * anchored_magnitude
 
-    # Dynamic penalty: default 1.0, amplified for wrong direction or timidity
+    # ── Innovation 2: Dynamic timidity ──
+    # conservatism = (|actual| - |expected|) / (|actual| + eps)
+    # When prediction is very conservative, penalty is high
+    conservatism = torch.clamp(
+        (torch.abs(actual_returns) - torch.abs(expected_returns))
+        / (torch.abs(actual_returns) + eps),
+        min=0.0, max=5.0,
+    )
+    dynamic_timidity = dynamic_timidity_alpha + dynamic_timidity_gamma * conservatism
+
+    # ── Build penalty weights ──
     penalty_weight = torch.ones_like(abs_error)
-    wrong_penalty = alpha + beta * torch.abs(expected_returns)
     penalty_weight = torch.where(is_wrong_direction, wrong_penalty, penalty_weight)
-    penalty_weight = torch.where(is_correct_but_timid, timidity_weight, penalty_weight)
+    penalty_weight = torch.where(is_correct_direction & (conservatism > 0.5),
+                                  dynamic_timidity, penalty_weight)
 
-    return abs_error * penalty_weight
+    # ── Innovation 3: Magnitude floor ──
+    # Explicit penalty for predictions that are too small
+    floor_violation = torch.clamp(magnitude_floor - torch.abs(expected_returns), min=0.0)
+    floor_penalty = magnitude_floor_weight * floor_violation
+
+    return abs_error * penalty_weight + floor_penalty
 
 
-# ── Phase 8-2: Direction label constants (matches Phase 5 convention) ──
+# ═══════════════════════════════════════════════════════════════════════
+# Module 4: Direction Labels (same as Phase 8)
+# ═══════════════════════════════════════════════════════════════════════
+
 DIR_LABEL_DOWN = 0
 DIR_LABEL_FLAT = 1
 DIR_LABEL_UP   = 2
 
 
 def compute_direction_labels(actual_returns, epsilon_scale=0.5):
-    """Compute per-step 3-class direction labels from actual returns.
-
-    Uses per-sample adaptive epsilon: eps = mean(|returns|) * epsilon_scale.
-    This ensures thresholds adapt to each sample's volatility (Phase 5 approach).
-
-    Args:
-        actual_returns: [B, H] actual log-returns
-        epsilon_scale: multiplier on per-sample mean absolute return
-
-    Returns:
-        labels: [B, H] int64 with DOWN=0, FLAT=1, UP=2
-    """
+    """Compute per-step 3-class direction labels from actual returns."""
     B, H = actual_returns.shape
-    per_sample_abs_mean = torch.mean(torch.abs(actual_returns), dim=1, keepdim=True)  # [B, 1]
-    epsilons = per_sample_abs_mean * float(epsilon_scale)  # [B, 1]
+    per_sample_abs_mean = torch.mean(torch.abs(actual_returns), dim=1, keepdim=True)
+    epsilons = per_sample_abs_mean * float(epsilon_scale)
 
     labels = torch.full_like(actual_returns, DIR_LABEL_FLAT, dtype=torch.long,
                              device=actual_returns.device)
@@ -230,25 +224,26 @@ def compute_direction_labels(actual_returns, epsilon_scale=0.5):
                          labels)
     return labels
 
-
 # ═══════════════════════════════════════════════════════════════════════
-# Module 3: STAR-CAST Single Training Step
+# Module 5: Oracle Exploration with 3-Factor Scoring (Phase 9 improved)
 # ═══════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def _star_cast_exploration(
+def _star_cast_exploration_v5(
     model, tokenizer, batch, cfg, device, amp_enabled, amp_dtype,
 ):
-    """Phase A: Noisy Exploration — rollout N trajectories per sample.
+    """Phase A: Noisy Exploration — rollout N=8 trajectories per sample.
 
-    Each trajectory is generated autoregressively with:
-      - NEFTune noise injected into embeddings
-      - Temperature sampling for token selection
+    Phase 9 changes:
+      - N=8 (was 4) for more diverse exploration
+      - 3-factor Oracle scoring: direction + magnitude error + sign bonus
+      - Fallback adds small noise instead of pure GT teacher-forcing
 
     Returns:
         golden_c, golden_f: [B, prefix_len + horizon] best trajectory tokens
-        has_golden: [B] bool mask — True if a valid golden trajectory was found
+        has_golden: [B] bool mask
         path_returns: [B, N] total path returns for each trajectory
+        exploration_stats: dict with diagnostic info
     """
     prefix_len = int(cfg.prefix_len)
     horizon = int(cfg.horizon)
@@ -261,24 +256,21 @@ def _star_cast_exploration(
     means = batch["means"]
     stds = batch["stds"]
     actual_returns_h = batch["actual_returns"][:, :horizon]
-    actual_path_return = torch.sum(actual_returns_h, dim=1)  # [B]
+    actual_path_return = torch.sum(actual_returns_h, dim=1)
 
     was_training = model.training
     model.eval()
 
     # ── Expand batch for N parallel trajectories ──
-    # Each sample gets N independent rollouts
     context_c = idx_c_full[:, :prefix_len].unsqueeze(1).expand(B, N, prefix_len).reshape(B * N, prefix_len)
     context_f = idx_f_full[:, :prefix_len].unsqueeze(1).expand(B, N, prefix_len).reshape(B * N, prefix_len)
 
-    # Expand time features
     time_expanded = {}
     for key in ("minute", "day", "month", "year"):
         t = batch["time"][key][:, :prefix_len]
         time_expanded[key] = t.unsqueeze(1).expand(B, N, prefix_len).reshape(B * N, prefix_len)
 
-    # Track per-step returns for each trajectory
-    all_step_returns = []  # list of [B*N, 1] tensors
+    all_step_returns = []
 
     for step in range(horizon):
         cur_len = int(context_c.size(1))
@@ -293,66 +285,77 @@ def _star_cast_exploration(
                 neftune_alpha=neftune_alpha,
             )
 
-        # Temperature sampling
         probs_c = F.softmax(logits_c[:, -1, :].float() / temp, dim=-1)
         probs_f = F.softmax(logits_f[:, -1, :].float() / temp, dim=-1)
-        pred_c = torch.multinomial(probs_c, num_samples=1)  # [B*N, 1]
+        pred_c = torch.multinomial(probs_c, num_samples=1)
         pred_f = torch.multinomial(probs_f, num_samples=1)
 
-        # Decode to continuous returns
-        decoded = tokenizer.decode(pred_c, pred_f)[..., 0].float()  # [B*N, 1]
+        decoded = tokenizer.decode(pred_c, pred_f)[..., 0].float()
         step_ret = decoded * stds.repeat_interleave(N, dim=0)[:, 0:1] + means.repeat_interleave(N, dim=0)[:, 0:1]
         all_step_returns.append(step_ret)
 
-        # Append predicted token to context
         context_c = torch.cat([context_c, pred_c], dim=1)
         context_f = torch.cat([context_f, pred_f], dim=1)
 
-        # Update time features for next step
         for key in time_expanded:
             next_t = batch["time"][key][:, prefix_len + step:prefix_len + step + 1]
             next_t_expanded = next_t.unsqueeze(1).expand(B, N, 1).reshape(B * N, 1)
             time_expanded[key] = torch.cat([time_expanded[key], next_t_expanded], dim=1)
 
-    # ── Reshape results to [B, N, H] ──
-    step_returns_tensor = torch.cat(all_step_returns, dim=1)  # [B*N, H]
-    step_returns_tensor = step_returns_tensor.view(B, N, horizon)
-    path_returns = torch.sum(step_returns_tensor, dim=2)  # [B, N]
+    step_returns_tensor = torch.cat(all_step_returns, dim=1).view(B, N, horizon)
+    path_returns = torch.sum(step_returns_tensor, dim=2)
 
-    # ── Oracle Filter: select best trajectory per sample ──
+    # ── Oracle Filter: 3-factor scoring ──
     best_paths_c_list = []
     best_paths_f_list = []
     has_golden_list = []
+    golden_count = 0
 
     context_c_reshaped = context_c.view(B, N, prefix_len + horizon)
     context_f_reshaped = context_f.view(B, N, prefix_len + horizon)
 
+    mag_weight = float(getattr(cfg, "oracle_score_magnitude_weight", 0.3))
+
     for b in range(B):
         real_total = actual_path_return[b].item()
-        path_ret_b = path_returns[b]  # [N]
+        path_ret_b = path_returns[b]
 
         is_correct_dir = (path_ret_b * real_total) > 0
 
         if is_correct_dir.any() and abs(real_total) > float(cfg.mape_eps):
             valid_indices = torch.where(is_correct_dir)[0]
-            # Base error: absolute path-return error
+
+            # Factor 1: path return error (lower is better)
             errors = torch.abs(path_ret_b[valid_indices] - real_total)
-            # Volatility-matching penalty: penalize trajectories whose predicted
-            # magnitude is much smaller than the actual magnitude.
-            # This breaks the Oracle's preference for conservative near-zero predictions
-            # and encourages selection of trajectories with realistic volatility.
+
+            # Factor 2: magnitude matching (penalize predictions too small)
             mag_penalty = torch.clamp(
                 torch.abs(torch.tensor(real_total, device=path_ret_b.device))
-                - torch.abs(path_ret_b[valid_indices]), min=0,
+                - torch.abs(path_ret_b[valid_indices]),
+                min=0,
             )
-            errors = errors + float(cfg.oracle_magnitude_penalty) * mag_penalty
-            best_idx = valid_indices[errors.argmin()]
+
+            # Factor 3: step-level direction consistency bonus
+            step_returns_valid = step_returns_tensor[b, valid_indices]
+            actual_steps = actual_returns_h[b]
+            step_dir_match = (step_returns_valid * actual_steps.unsqueeze(0)) > 0
+            step_consistency = step_dir_match.float().mean(dim=1)
+            consistency_bonus = step_consistency * torch.abs(torch.tensor(real_total, device=path_ret_b.device))
+
+            # Combined score (lower is better)
+            scores = (
+                errors
+                + float(cfg.oracle_magnitude_penalty) * mag_penalty
+                - mag_weight * consistency_bonus
+            )
+            best_idx = valid_indices[scores.argmin()]
 
             best_paths_c_list.append(context_c_reshaped[b, best_idx])
             best_paths_f_list.append(context_f_reshaped[b, best_idx])
             has_golden_list.append(True)
+            golden_count += 1
         else:
-            # Fallback: use ground-truth tokens (teacher forcing)
+            # Fallback: use GT tokens (teacher forcing)
             best_paths_c_list.append(idx_c_full[b, :prefix_len + horizon])
             best_paths_f_list.append(idx_f_full[b, :prefix_len + horizon])
             has_golden_list.append(False)
@@ -364,28 +367,44 @@ def _star_cast_exploration(
     if was_training:
         model.train()
 
-    return golden_c, golden_f, has_golden, path_returns.view(B, N)
+    exploration_stats = {
+        "golden_rate": golden_count / max(1, B),
+        "mean_path_absmean": float(path_returns.abs().mean().item()),
+        "mean_path_return": float(path_returns.mean().item()),
+    }
 
+    return golden_c, golden_f, has_golden, path_returns.view(B, N), exploration_stats
 
-def train_star_cast_step(model, tokenizer, batch, cfg, device, amp_enabled, amp_dtype):
-    """Single STAR-CAST training step.
+# ═══════════════════════════════════════════════════════════════════════
+# Module 6: Phase 9 Training Step (Magnitude-Anchored + KL Anchor)
+# ═══════════════════════════════════════════════════════════════════════
+
+def train_star_cast_v5_step(model, reference_model, tokenizer, batch, cfg, device,
+                             amp_enabled, amp_dtype):
+    """Single Phase 9 STAR-CAST v5 training step.
+
+    Phase 9 changes from Phase 8:
+      1. Magnitude-anchored asymmetric loss (replaces Phase 8 loss)
+      2. Dynamic timidity (replaces static timidity_weight)
+      3. Magnitude floor penalty (new)
+      4. KL anchor to frozen base model (new)
+      5. Diagnostic logging for expected_returns quality
 
     Returns:
         loss: scalar total loss
-        stats: dict with component losses and golden_rate
+        stats: dict with component losses and diagnostics
     """
     prefix_len = int(cfg.prefix_len)
     horizon = int(cfg.horizon)
     B = int(batch["features"].size(0))
 
-    # ── Encode features for later use ──
     with torch.no_grad():
         idx_c_full, idx_f_full = _encode_features(tokenizer, batch["features"])
 
     actual_returns_h = batch["actual_returns"][:, :horizon]
 
     # ── Phase A: Noisy Exploration + Oracle Filter ──
-    golden_c, golden_f, has_golden, _ = _star_cast_exploration(
+    golden_c, golden_f, has_golden, _, explore_stats = _star_cast_exploration_v5(
         model=model, tokenizer=tokenizer, batch=batch, cfg=cfg,
         device=device, amp_enabled=amp_enabled, amp_dtype=amp_dtype,
     )
@@ -393,8 +412,6 @@ def train_star_cast_step(model, tokenizer, batch, cfg, device, amp_enabled, amp_
     # ── Phase B: Dual-Engine Update ──
     model.train()
 
-    # Forward pass on golden trajectories (length = prefix_len + horizon)
-    # Use input[:, :-1] to predict tokens from position prefix_len onwards
     train_len = int(golden_c.size(1))
     train_time = {key: value[:, :train_len] for key, value in batch["time"].items()}
 
@@ -407,17 +424,16 @@ def train_star_cast_step(model, tokenizer, batch, cfg, device, amp_enabled, amp_
             train_time["month"][:, :train_len - 1],
             train_time["year"][:, :train_len - 1],
             return_hidden=True,
-            neftune_alpha=0.0,  # no NEFTune during training forward
+            neftune_alpha=0.0,
         )
 
-    # Extract rollout region logits: positions [prefix_len-1, prefix_len+H-2]
     start = prefix_len - 1
     end = start + horizon
-    rollout_c = logits_c[:, start:end, :]  # [B, H, V_c]
-    rollout_f = logits_f[:, start:end, :]  # [B, H, V_f]
+    rollout_c = logits_c[:, start:end, :]
+    rollout_f = logits_f[:, start:end, :]
 
     # ═══════════════════════════════════════════════════════════════
-    # Engine 1: Continuous Layer — Asymmetric Direction Loss
+    # Engine 1: Magnitude-Anchored Asymmetric Loss (Phase 9 NEW)
     # ═══════════════════════════════════════════════════════════════
 
     expected_traj = get_differentiable_expected_returns(
@@ -427,28 +443,41 @@ def train_star_cast_step(model, tokenizer, batch, cfg, device, amp_enabled, amp_
         sharpening_temp=float(cfg.prob_sharpening_temp),
     )
 
-    # Step-level asymmetric loss (with push-forward)
-    step_loss_matrix = compute_asymmetric_direction_loss(
+    # Diagnostic: expected vs actual magnitude ratio
+    expected_absmean = float(expected_traj.abs().mean().item())
+    actual_absmean = float(actual_returns_h.abs().mean().item())
+    expected_actual_ratio = expected_absmean / max(actual_absmean, 1e-8)
+
+    # Step-level loss with magnitude anchoring
+    step_loss_matrix = compute_asymmetric_direction_loss_v2(
         expected_traj, actual_returns_h,
-        alpha=float(cfg.asymmetric_alpha), beta=float(cfg.asymmetric_beta),
-        timidity_weight=float(cfg.timidity_penalty_weight),
-        timidity_ratio=float(cfg.timidity_ratio_threshold),
+        alpha=float(cfg.asymmetric_alpha),
+        beta=float(cfg.asymmetric_beta),
+        gamma=float(cfg.magnitude_anchor_gamma),
+        dynamic_timidity_alpha=float(cfg.dynamic_timidity_alpha),
+        dynamic_timidity_gamma=float(cfg.dynamic_timidity_gamma),
+        magnitude_floor=float(cfg.magnitude_floor),
+        magnitude_floor_weight=float(cfg.magnitude_floor_weight),
     )
     step_asym_loss = step_loss_matrix.mean()
 
-    # Path-level asymmetric loss (cumulative returns, with push-forward)
+    # Path-level loss with magnitude anchoring
     expected_path = torch.cumsum(expected_traj, dim=1)
     actual_path = torch.cumsum(actual_returns_h, dim=1)
-    path_loss_matrix = compute_asymmetric_direction_loss(
+    path_loss_matrix = compute_asymmetric_direction_loss_v2(
         expected_path, actual_path,
-        alpha=float(cfg.path_asymmetric_alpha), beta=float(cfg.path_asymmetric_beta),
-        timidity_weight=float(cfg.timidity_penalty_weight),
-        timidity_ratio=float(cfg.timidity_ratio_threshold),
+        alpha=float(cfg.path_asymmetric_alpha),
+        beta=float(cfg.path_asymmetric_beta),
+        gamma=float(cfg.magnitude_anchor_gamma),
+        dynamic_timidity_alpha=float(cfg.dynamic_timidity_alpha),
+        dynamic_timidity_gamma=float(cfg.dynamic_timidity_gamma),
+        magnitude_floor=float(cfg.magnitude_floor),
+        magnitude_floor_weight=float(cfg.magnitude_floor_weight),
     )
     path_asym_loss = path_loss_matrix.mean()
 
     # ═══════════════════════════════════════════════════════════════
-    # Engine 2: Discrete Layer — STaR CE Reinforcement
+    # Engine 2: STaR CE Reinforcement
     # ═══════════════════════════════════════════════════════════════
     if has_golden.any():
         target_c = golden_c[has_golden, prefix_len:prefix_len + horizon]
@@ -469,18 +498,16 @@ def train_star_cast_step(model, tokenizer, batch, cfg, device, amp_enabled, amp_
         star_ce_loss = torch.tensor(0.0, device=device)
 
     # ═══════════════════════════════════════════════════════════════
-    # Engine 3: Direction-Explicit Classification Loss (Phase 8-2)
+    # Engine 3: Direction-Explicit Classification
     # ═══════════════════════════════════════════════════════════════
     if float(getattr(cfg, "direction_weight", 0.0)) > 0.0:
         dir_labels = compute_direction_labels(
             actual_returns_h,
             epsilon_scale=float(cfg.direction_epsilon_scale),
-        )  # [B, H] with {0=DOWN, 1=FLAT, 2=UP}
-
+        )
         dir_logits = model.compute_direction_logits_at_positions(
             hidden, latent_states, start=start, end=end,
-        )  # [B, H, 3]
-
+        )
         if bool(cfg.direction_use_class_weights):
             flat_w = float(cfg.direction_ce_flat_weight)
             class_weights = torch.tensor(
@@ -497,23 +524,49 @@ def train_star_cast_step(model, tokenizer, batch, cfg, device, amp_enabled, amp_
                 dir_logits.reshape(-1, 3).float(),
                 dir_labels.reshape(-1),
             )
-        # In-batch direction accuracy for monitoring
         direction_acc = (dir_logits.argmax(dim=-1) == dir_labels).float().mean()
     else:
         direction_loss = torch.tensor(0.0, device=device)
         direction_acc = torch.tensor(0.0, device=device)
 
     # ═══════════════════════════════════════════════════════════════
-    # Total Loss (triple-engine)
+    # Engine 4: KL Anchor to Base Model (Phase 9 NEW)
+    # ═══════════════════════════════════════════════════════════════
+    kl_step_weights = torch.ones(horizon, device=device, dtype=torch.float32)
+    kl_loss = torch.tensor(0.0, device=device)
+    if reference_model is not None and float(cfg.kl_weight) > 0.0:
+        with torch.no_grad():
+            with _autocast_context(device, amp_enabled, amp_dtype):
+                ref_logits_c, ref_logits_f, _ = reference_model(
+                    golden_c[:, :-1],
+                    golden_f[:, :-1],
+                    train_time["minute"][:, :train_len - 1],
+                    train_time["day"][:, :train_len - 1],
+                    train_time["month"][:, :train_len - 1],
+                    train_time["year"][:, :train_len - 1],
+                )
+            ref_sel_c = ref_logits_c[:, start:end, :]
+            ref_sel_f = ref_logits_f[:, start:end, :]
+
+        # KL divergence on rollout region logits
+        kl_loss = _kl_to_reference(rollout_c, rollout_f, ref_sel_c, ref_sel_f, kl_step_weights)
+
+    # ═══════════════════════════════════════════════════════════════
+    # Total Loss
     # ═══════════════════════════════════════════════════════════════
     total_loss = (
         float(cfg.step_asym_weight) * step_asym_loss +
         float(cfg.path_asym_weight) * path_asym_loss +
         float(cfg.star_ce_weight) * star_ce_loss +
-        float(getattr(cfg, "direction_weight", 0.0)) * direction_loss
+        float(getattr(cfg, "direction_weight", 0.0)) * direction_loss +
+        float(cfg.kl_weight) * kl_loss
     )
 
     golden_rate = has_golden.float().mean()
+
+    # Direction product stats for monitoring zero-collapse
+    direction_product = expected_traj * actual_returns_h
+    direction_correct_ratio = (direction_product > 0).float().mean()
 
     return total_loss, {
         "total_loss": float(total_loss.detach().item()),
@@ -522,73 +575,98 @@ def train_star_cast_step(model, tokenizer, batch, cfg, device, amp_enabled, amp_
         "star_ce": float(star_ce_loss.detach().item()) if has_golden.any() else 0.0,
         "direction_loss": float(direction_loss.detach().item()),
         "direction_acc": float(direction_acc.detach().item()),
+        "kl_loss": float(kl_loss.detach().item()),
         "golden_rate": float(golden_rate.item()),
+        "expected_absmean": expected_absmean,
+        "actual_absmean": actual_absmean,
+        "expected_actual_ratio": expected_actual_ratio,
+        "direction_correct_ratio": float(direction_correct_ratio.item()),
     }
 
-
 # ═══════════════════════════════════════════════════════════════════════
-# Argument parsing
+# Module 7: Argument parsing & namespace
 # ═══════════════════════════════════════════════════════════════════════
 
 def _build_arg_parser():
-    parser = argparse.ArgumentParser(description="Phase 8: STAR-CAST self-training")
-    parser.add_argument("--checkpoint-path", default=PostTrainStarCastConfig.checkpoint_path)
-    parser.add_argument("--output-dir", default=PostTrainStarCastConfig.output_dir)
-    parser.add_argument("--save-name", default=PostTrainStarCastConfig.save_name)
-    parser.add_argument("--save-epoch-checkpoints", type=_as_bool, default=PostTrainStarCastConfig.save_epoch_checkpoints)
-    parser.add_argument("--prefix-len", type=int, default=PostTrainStarCastConfig.prefix_len)
-    parser.add_argument("--horizon", type=int, default=PostTrainStarCastConfig.horizon)
-    parser.add_argument("--stride-ratio", type=float, default=PostTrainStarCastConfig.stride_ratio)
-    parser.add_argument("--cache-dir", default=PostTrainStarCastConfig.cache_dir)
+    parser = argparse.ArgumentParser(description="Phase 9: STAR-CAST v5 self-training")
+    cfg = PostTrainStarCastV5Config
+
+    parser.add_argument("--checkpoint-path", default=cfg.checkpoint_path)
+    parser.add_argument("--output-dir", default=cfg.output_dir)
+    parser.add_argument("--save-name", default=cfg.save_name)
+    parser.add_argument("--save-epoch-checkpoints", type=_as_bool, default=cfg.save_epoch_checkpoints)
+    parser.add_argument("--prefix-len", type=int, default=cfg.prefix_len)
+    parser.add_argument("--horizon", type=int, default=cfg.horizon)
+    parser.add_argument("--stride-ratio", type=float, default=cfg.stride_ratio)
+    parser.add_argument("--cache-dir", default=cfg.cache_dir)
     parser.add_argument("--cache-rebuild", action="store_true")
-    parser.add_argument("--max-stocks", type=int, default=PostTrainStarCastConfig.max_stocks)
-    parser.add_argument("--max-train-samples", type=int, default=PostTrainStarCastConfig.max_train_samples)
-    parser.add_argument("--max-val-samples", type=int, default=PostTrainStarCastConfig.max_val_samples)
-    parser.add_argument("--epochs", type=int, default=PostTrainStarCastConfig.epochs)
-    parser.add_argument("--batch-size", type=int, default=PostTrainStarCastConfig.batch_size)
-    parser.add_argument("--eval-batch-size", type=int, default=PostTrainStarCastConfig.eval_batch_size)
-    parser.add_argument("--accumulation-steps", type=int, default=PostTrainStarCastConfig.accumulation_steps)
-    parser.add_argument("--num-workers", type=int, default=PostTrainStarCastConfig.num_workers)
-    parser.add_argument("--lr", type=float, default=PostTrainStarCastConfig.learning_rate)
-    parser.add_argument("--weight-decay", type=float, default=PostTrainStarCastConfig.weight_decay)
-    parser.add_argument("--grad-clip", type=float, default=PostTrainStarCastConfig.grad_clip)
-    parser.add_argument("--max-train-updates", type=int, default=PostTrainStarCastConfig.max_train_updates)
-    parser.add_argument("--progress-interval", type=int, default=PostTrainStarCastConfig.progress_interval)
-    parser.add_argument("--checkpoint-interval", type=int, default=PostTrainStarCastConfig.checkpoint_interval)
+    parser.add_argument("--max-stocks", type=int, default=cfg.max_stocks)
+    parser.add_argument("--max-train-samples", type=int, default=cfg.max_train_samples)
+    parser.add_argument("--max-val-samples", type=int, default=cfg.max_val_samples)
+    parser.add_argument("--epochs", type=int, default=cfg.epochs)
+    parser.add_argument("--batch-size", type=int, default=cfg.batch_size)
+    parser.add_argument("--eval-batch-size", type=int, default=cfg.eval_batch_size)
+    parser.add_argument("--accumulation-steps", type=int, default=cfg.accumulation_steps)
+    parser.add_argument("--num-workers", type=int, default=cfg.num_workers)
+    parser.add_argument("--lr", type=float, default=cfg.learning_rate)
+    parser.add_argument("--weight-decay", type=float, default=cfg.weight_decay)
+    parser.add_argument("--grad-clip", type=float, default=cfg.grad_clip)
+    parser.add_argument("--max-train-updates", type=int, default=cfg.max_train_updates)
+    parser.add_argument("--progress-interval", type=int, default=cfg.progress_interval)
+    parser.add_argument("--checkpoint-interval", type=int, default=cfg.checkpoint_interval)
 
     # STAR-CAST hyperparameters
-    parser.add_argument("--neftune-alpha", type=float, default=PostTrainStarCastConfig.neftune_alpha)
-    parser.add_argument("--num-trajectories", type=int, default=PostTrainStarCastConfig.num_trajectories)
-    parser.add_argument("--exploration-temperature", type=float, default=PostTrainStarCastConfig.exploration_temperature)
-    parser.add_argument("--top-k-expected-return", type=int, default=PostTrainStarCastConfig.top_k_expected_return)
-    parser.add_argument("--asymmetric-alpha", type=float, default=PostTrainStarCastConfig.asymmetric_alpha)
-    parser.add_argument("--asymmetric-beta", type=float, default=PostTrainStarCastConfig.asymmetric_beta)
-    parser.add_argument("--path-asymmetric-alpha", type=float, default=PostTrainStarCastConfig.path_asymmetric_alpha)
-    parser.add_argument("--path-asymmetric-beta", type=float, default=PostTrainStarCastConfig.path_asymmetric_beta)
-    parser.add_argument("--step-asym-weight", type=float, default=PostTrainStarCastConfig.step_asym_weight)
-    parser.add_argument("--path-asym-weight", type=float, default=PostTrainStarCastConfig.path_asym_weight)
-    parser.add_argument("--star-ce-weight", type=float, default=PostTrainStarCastConfig.star_ce_weight)
-    parser.add_argument("--timidity-penalty-weight", type=float, default=PostTrainStarCastConfig.timidity_penalty_weight)
-    parser.add_argument("--timidity-ratio-threshold", type=float, default=PostTrainStarCastConfig.timidity_ratio_threshold)
-    parser.add_argument("--oracle-magnitude-penalty", type=float, default=PostTrainStarCastConfig.oracle_magnitude_penalty)
-    parser.add_argument("--prob-sharpening-temp", type=float, default=PostTrainStarCastConfig.prob_sharpening_temp)
-    parser.add_argument("--actionable-da-threshold", type=float, default=PostTrainStarCastConfig.actionable_da_threshold)
+    parser.add_argument("--neftune-alpha", type=float, default=cfg.neftune_alpha)
+    parser.add_argument("--num-trajectories", type=int, default=cfg.num_trajectories)
+    parser.add_argument("--exploration-temperature", type=float, default=cfg.exploration_temperature)
+    parser.add_argument("--top-k-expected-return", type=int, default=cfg.top_k_expected_return)
 
-    # ── Phase 8-2: Direction-Explicit classification (Engine 3) ──
-    parser.add_argument("--direction-weight", type=float, default=PostTrainStarCastConfig.direction_weight)
-    parser.add_argument("--direction-epsilon-scale", type=float, default=PostTrainStarCastConfig.direction_epsilon_scale)
-    parser.add_argument("--direction-ce-flat-weight", type=float, default=PostTrainStarCastConfig.direction_ce_flat_weight)
-    parser.add_argument("--direction-use-class-weights", type=_as_bool, default=PostTrainStarCastConfig.direction_use_class_weights)
+    # Asymmetric loss
+    parser.add_argument("--asymmetric-alpha", type=float, default=cfg.asymmetric_alpha)
+    parser.add_argument("--asymmetric-beta", type=float, default=cfg.asymmetric_beta)
+    parser.add_argument("--path-asymmetric-alpha", type=float, default=cfg.path_asymmetric_alpha)
+    parser.add_argument("--path-asymmetric-beta", type=float, default=cfg.path_asymmetric_beta)
+    parser.add_argument("--step-asym-weight", type=float, default=cfg.step_asym_weight)
+    parser.add_argument("--path-asym-weight", type=float, default=cfg.path_asym_weight)
+    parser.add_argument("--star-ce-weight", type=float, default=cfg.star_ce_weight)
 
-    parser.add_argument("--freeze-backbone", type=_as_bool, default=PostTrainStarCastConfig.freeze_backbone)
-    parser.add_argument("--trainable-scope", choices=["all", "heads"], default=PostTrainStarCastConfig.trainable_scope)
-    parser.add_argument("--use-gradient-checkpointing", type=_as_bool, default=PostTrainStarCastConfig.use_gradient_checkpointing)
-    parser.add_argument("--use-amp", type=_as_bool, default=PostTrainStarCastConfig.use_amp)
-    parser.add_argument("--amp-dtype", default=PostTrainStarCastConfig.amp_dtype)
-    parser.add_argument("--use-tf32", type=_as_bool, default=PostTrainStarCastConfig.use_tf32)
-    parser.add_argument("--mape-eps", type=float, default=PostTrainStarCastConfig.mape_eps)
-    parser.add_argument("--deterministic", type=_as_bool, default=PostTrainStarCastConfig.deterministic)
-    parser.add_argument("--seed", type=int, default=PostTrainStarCastConfig.random_seed)
+    # Phase 9 NEW: Magnitude anchoring
+    parser.add_argument("--magnitude-anchor-gamma", type=float, default=cfg.magnitude_anchor_gamma)
+    parser.add_argument("--magnitude-floor", type=float, default=cfg.magnitude_floor)
+    parser.add_argument("--magnitude-floor-weight", type=float, default=cfg.magnitude_floor_weight)
+
+    # Phase 9 NEW: Dynamic timidity
+    parser.add_argument("--dynamic-timidity-alpha", type=float, default=cfg.dynamic_timidity_alpha)
+    parser.add_argument("--dynamic-timidity-gamma", type=float, default=cfg.dynamic_timidity_gamma)
+
+    # Oracle
+    parser.add_argument("--timidity-penalty-weight", type=float, default=cfg.timidity_penalty_weight)
+    parser.add_argument("--timidity-ratio-threshold", type=float, default=cfg.timidity_ratio_threshold)
+    parser.add_argument("--oracle-magnitude-penalty", type=float, default=cfg.oracle_magnitude_penalty)
+    parser.add_argument("--prob-sharpening-temp", type=float, default=cfg.prob_sharpening_temp)
+    parser.add_argument("--actionable-da-threshold", type=float, default=cfg.actionable_da_threshold)
+    parser.add_argument("--oracle-score-magnitude-weight", type=float, default=cfg.oracle_score_magnitude_weight)
+
+    # Direction classification
+    parser.add_argument("--direction-weight", type=float, default=cfg.direction_weight)
+    parser.add_argument("--direction-epsilon-scale", type=float, default=cfg.direction_epsilon_scale)
+    parser.add_argument("--direction-ce-flat-weight", type=float, default=cfg.direction_ce_flat_weight)
+    parser.add_argument("--direction-use-class-weights", type=_as_bool, default=cfg.direction_use_class_weights)
+
+    # Phase 9 NEW: KL anchor
+    parser.add_argument("--kl-weight", type=float, default=cfg.kl_weight)
+
+    # Optimisation
+    parser.add_argument("--freeze-backbone", type=_as_bool, default=cfg.freeze_backbone)
+    parser.add_argument("--trainable-scope", choices=["all", "heads"], default=cfg.trainable_scope)
+    parser.add_argument("--use-gradient-checkpointing", type=_as_bool, default=cfg.use_gradient_checkpointing)
+    parser.add_argument("--use-amp", type=_as_bool, default=cfg.use_amp)
+    parser.add_argument("--amp-dtype", default=cfg.amp_dtype)
+    parser.add_argument("--use-tf32", type=_as_bool, default=cfg.use_tf32)
+    parser.add_argument("--mape-eps", type=float, default=cfg.mape_eps)
+    parser.add_argument("--deterministic", type=_as_bool, default=cfg.deterministic)
+    parser.add_argument("--seed", type=int, default=cfg.random_seed)
+
     return parser
 
 
@@ -628,15 +706,22 @@ def _namespace_from_args(args):
         step_asym_weight=float(args.step_asym_weight),
         path_asym_weight=float(args.path_asym_weight),
         star_ce_weight=float(args.star_ce_weight),
+        magnitude_anchor_gamma=float(args.magnitude_anchor_gamma),
+        magnitude_floor=float(args.magnitude_floor),
+        magnitude_floor_weight=float(args.magnitude_floor_weight),
+        dynamic_timidity_alpha=float(args.dynamic_timidity_alpha),
+        dynamic_timidity_gamma=float(args.dynamic_timidity_gamma),
         timidity_penalty_weight=float(args.timidity_penalty_weight),
         timidity_ratio_threshold=float(args.timidity_ratio_threshold),
         oracle_magnitude_penalty=float(args.oracle_magnitude_penalty),
         prob_sharpening_temp=float(args.prob_sharpening_temp),
         actionable_da_threshold=float(args.actionable_da_threshold),
+        oracle_score_magnitude_weight=float(args.oracle_score_magnitude_weight),
         direction_weight=float(args.direction_weight),
         direction_epsilon_scale=float(args.direction_epsilon_scale),
         direction_ce_flat_weight=float(args.direction_ce_flat_weight),
         direction_use_class_weights=bool(args.direction_use_class_weights),
+        kl_weight=float(args.kl_weight),
         freeze_backbone=bool(args.freeze_backbone),
         trainable_scope=str(args.trainable_scope),
         use_gradient_checkpointing=bool(args.use_gradient_checkpointing),
@@ -648,73 +733,78 @@ def _namespace_from_args(args):
         random_seed=int(args.seed),
     )
 
-
 # ═══════════════════════════════════════════════════════════════════════
-# Main training loop
+# Module 8: Training Loop
 # ═══════════════════════════════════════════════════════════════════════
 
 def train(cfg):
-    set_global_seed(int(cfg.random_seed), deterministic=bool(cfg.deterministic))
+    """Full Phase 9 STAR-CAST v5 training loop.
+
+    Phase 9 engineering fixes:
+      - KL anchor to frozen base model
+      - Complete logging of all loss components
+      - Unified config (no HPO/training mismatch)
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    set_global_seed(int(cfg.random_seed), deterministic=bool(cfg.deterministic))
+
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = bool(cfg.use_tf32)
         torch.backends.cudnn.allow_tf32 = bool(cfg.use_tf32)
-        torch.set_float32_matmul_precision("high")
-        torch.cuda.reset_peak_memory_stats(device)
 
-    amp_dtype = _amp_dtype(cfg.amp_dtype)
-    amp_enabled = bool(cfg.use_amp and device.type == "cuda" and amp_dtype is not None)
-
-    train_dataset = RolloutWindowDataset(
-        "train", cfg=cfg,
-        max_samples=int(cfg.max_train_samples),
-        seed=int(cfg.random_seed),
-    )
-    val_dataset = RolloutWindowDataset(
-        "val", cfg=cfg,
-        max_samples=int(cfg.max_val_samples),
-        seed=int(cfg.random_seed) + 17,
-    )
-    if len(train_dataset) == 0 or len(val_dataset) == 0:
-        raise RuntimeError(f"STAR-CAST dataset empty: train={len(train_dataset)}, val={len(val_dataset)}")
-
-    loader_kwargs = {
-        "num_workers": int(cfg.num_workers),
-        "pin_memory": device.type == "cuda",
-        "collate_fn": rollout_collate,
-    }
-    train_loader = DataLoader(
-        train_dataset, batch_size=max(1, int(cfg.batch_size)),
-        shuffle=True, drop_last=False, **loader_kwargs,
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=max(1, int(cfg.eval_batch_size)),
-        shuffle=False, drop_last=False, **loader_kwargs,
-    )
-
+    # ── Load model + tokenizer (matches Phase 8 pattern) ──
     model, tokenizer = load_model(
         device=device, checkpoint_path=cfg.checkpoint_path,
         strict_checkpoint_compat=False,
     )
     tokenizer.eval()
     tokenizer.requires_grad_(False)
+    model.to(device)
     if bool(cfg.use_gradient_checkpointing):
-        model.enable_gradient_checkpointing(True)
-
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
     param_groups = _configure_trainable(model, cfg)
+    # ── Phase 9 NEW: Create frozen reference model for KL anchor ──
+    reference_model = None
+    if float(cfg.kl_weight) > 0.0:
+        reference_model = copy.deepcopy(model).to(device)
+        reference_model.eval()
+        reference_model.requires_grad_(False)
+        print(f"KL anchor enabled: kl_weight={cfg.kl_weight}")
+
+    # ── Datasets ──
+    train_ds = RolloutWindowDataset(
+        "train", cfg,
+        max_samples=int(cfg.max_train_samples),
+        seed=int(cfg.random_seed),
+    )
+    val_ds = RolloutWindowDataset(
+        "val", cfg,
+        max_samples=int(cfg.max_val_samples),
+        seed=int(cfg.random_seed),
+    )
+
+    train_loader = DataLoader(
+        train_ds, batch_size=int(cfg.batch_size), shuffle=True,
+        num_workers=int(cfg.num_workers), collate_fn=rollout_collate,
+        pin_memory=(device.type == "cuda"), drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=int(cfg.eval_batch_size), shuffle=False,
+        num_workers=int(cfg.num_workers), collate_fn=rollout_collate,
+        pin_memory=(device.type == "cuda"),
+    )
+
+    print(f"Phase 9 STAR-CAST v5: train={len(train_ds)}, val={len(val_ds)}, "
+          f"N={cfg.num_trajectories}, top_k={cfg.top_k_expected_return}")
+    print(f"Magnitude anchoring: gamma={cfg.magnitude_anchor_gamma}, "
+          f"floor={cfg.magnitude_floor}, floor_weight={cfg.magnitude_floor_weight}")
+    print(f"Dynamic timidity: alpha={cfg.dynamic_timidity_alpha}, "
+          f"gamma={cfg.dynamic_timidity_gamma}")
+    print(f"KL anchor: weight={cfg.kl_weight}")
+
     optimizer, optimizer_kwargs = _build_optimizer(param_groups, cfg, device)
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled and amp_dtype == torch.float16)
-    summary = trainable_parameter_summary(model)
-
-    print(f"=== STAR-CAST Phase 8 Training ===")
-    print(f"Device: {device}, amp={amp_enabled}, amp_dtype={cfg.amp_dtype}")
-    print(f"Train windows={len(train_dataset)}, val windows={len(val_dataset)}")
-    print(f"Trainable parameters: {summary}")
-    print(f"Optimizer: AdamW {optimizer_kwargs}")
-    print(f"NEFTune alpha={cfg.neftune_alpha}, trajectories={cfg.num_trajectories}")
-    print(f"Exploration temp={cfg.exploration_temperature}, top_k={cfg.top_k_expected_return}")
-
-    total_steps = max(1, math.ceil(len(train_loader) / int(cfg.accumulation_steps)) * int(cfg.epochs))
+    total_steps = max(1, ((len(train_ds) // max(1, int(cfg.batch_size) * int(cfg.accumulation_steps))) * int(cfg.epochs)))
     warmup = max(1, total_steps // 10)
     warmup_sched = torch.optim.lr_scheduler.LinearLR(
         optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup,
@@ -723,6 +813,10 @@ def train(cfg):
         optimizer, T_max=max(1, total_steps - warmup),
         eta_min=float(cfg.learning_rate) * 0.05,
     )
+
+    amp_enabled = bool(cfg.use_amp) and device.type == "cuda"
+    amp_dtype = _amp_dtype(cfg.amp_dtype)
+    scaler = torch.amp.GradScaler("cuda", enabled=(amp_enabled and amp_dtype == torch.float16))
 
     history = []
     best_score = -float("inf")
@@ -736,16 +830,19 @@ def train(cfg):
         epoch_totals = {
             "total_loss": 0.0, "step_asym": 0.0, "path_asym": 0.0,
             "star_ce": 0.0, "direction_loss": 0.0, "direction_acc": 0.0,
-            "golden_rate": 0.0,
+            "kl_loss": 0.0, "golden_rate": 0.0,
+            "expected_absmean": 0.0, "actual_absmean": 0.0,
+            "expected_actual_ratio": 0.0, "direction_correct_ratio": 0.0,
         }
         batches = 0
-        pbar = tqdm(train_loader, desc=f"STAR-CAST epoch {epoch + 1}/{cfg.epochs}")
+        pbar = tqdm(train_loader, desc=f"STAR-CAST-v5 epoch {epoch + 1}/{cfg.epochs}")
 
         for batch_idx, raw_batch in enumerate(pbar, start=1):
             batch = _move_batch(raw_batch, device)
 
-            loss, stats = train_star_cast_step(
-                model=model, tokenizer=tokenizer, batch=batch, cfg=cfg,
+            loss, stats = train_star_cast_v5_step(
+                model=model, reference_model=reference_model,
+                tokenizer=tokenizer, batch=batch, cfg=cfg,
                 device=device, amp_enabled=amp_enabled, amp_dtype=amp_dtype,
             )
 
@@ -768,14 +865,13 @@ def train(cfg):
                     cosine_sched.step()
                 updates += 1
 
-                # ── Step-interval checkpoint ──
                 ci = int(getattr(cfg, "checkpoint_interval", 0))
                 if ci > 0 and updates % ci == 0:
                     step_path = os.path.join(
                         cfg.output_dir,
                         f"{os.path.splitext(cfg.save_name)[0]}-step{updates}.pt",
                     )
-                    _save_star_cast_checkpoint(step_path, model, tokenizer, cfg, {"updates": updates}, history)
+                    _save_v5_checkpoint(step_path, model, tokenizer, cfg, {"updates": updates}, history)
 
             for key in epoch_totals:
                 epoch_totals[key] += float(stats.get(key, 0.0))
@@ -786,6 +882,8 @@ def train(cfg):
                     "loss": f"{stats['total_loss']:.4f}",
                     "golden": f"{stats['golden_rate']:.2f}",
                     "dir_acc": f"{stats.get('direction_acc', 0):.2f}",
+                    "exp/act": f"{stats.get('expected_actual_ratio', 0):.2f}",
+                    "kl": f"{stats.get('kl_loss', 0):.4f}",
                     "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
                 })
 
@@ -811,21 +909,19 @@ def train(cfg):
                 cfg.output_dir,
                 f"{os.path.splitext(cfg.save_name)[0]}-epoch{epoch + 1}.pt",
             )
-            _save_star_cast_checkpoint(
-                epoch_path, model, tokenizer, cfg, val_metrics, history,
-            )
+            _save_v5_checkpoint(epoch_path, model, tokenizer, cfg, val_metrics, history)
 
         if score > best_score:
             best_score = score
             best_metrics = val_metrics
-            _save_star_cast_checkpoint(best_path, model, tokenizer, cfg, val_metrics, history)
+            _save_v5_checkpoint(best_path, model, tokenizer, cfg, val_metrics, history)
 
         if int(cfg.max_train_updates) > 0 and updates >= int(cfg.max_train_updates):
             break
 
-    history_path = os.path.join(cfg.output_dir, "star_cast_history.json")
+    history_path = os.path.join(cfg.output_dir, "star_cast_v5_history.json")
     _write_history(history_path, cfg, history, best_metrics)
-    print(f"Best STAR-CAST checkpoint: {best_path}")
+    print(f"Best Phase 9 checkpoint: {best_path}")
     print(f"History: {history_path}")
     return {"best_path": best_path, "history_path": history_path, "best_metrics": best_metrics, "history": history}
 

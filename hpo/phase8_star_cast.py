@@ -106,6 +106,11 @@ FIXED_PARAMS = {
     "oracle_magnitude_penalty": 2.0,
     "prob_sharpening_temp": 0.5,
     "actionable_da_threshold": 0.005,
+    # Phase 8-2: Direction-Explicit classification
+    "direction_weight": 0.3,
+    "direction_epsilon_scale": 0.5,
+    "direction_ce_flat_weight": 0.3,
+    "direction_use_class_weights": True,
 }
 
 
@@ -280,6 +285,24 @@ def _asymmetric_direction_loss(expected, actual, alpha, beta, eps=1e-4,
     penalty = torch.where(is_wrong, alpha + beta * torch.abs(expected), penalty)
     penalty = torch.where(is_correct_but_timid, timidity_weight, penalty)
     return abs_err * penalty
+
+
+# Phase 8-2: Direction label constants
+_DIR_LABEL_DOWN = 0
+_DIR_LABEL_FLAT = 1
+_DIR_LABEL_UP   = 2
+
+
+def _direction_labels(actual_returns, epsilon_scale=0.5):
+    """3-class direction labels using per-sample adaptive epsilon."""
+    per_sample_abs_mean = torch.mean(torch.abs(actual_returns), dim=1, keepdim=True)
+    epsilons = per_sample_abs_mean * epsilon_scale
+    labels = torch.full_like(actual_returns, _DIR_LABEL_FLAT, dtype=torch.long)
+    labels = torch.where(actual_returns > epsilons,
+                         torch.full_like(labels, _DIR_LABEL_UP), labels)
+    labels = torch.where(actual_returns < -epsilons,
+                         torch.full_like(labels, _DIR_LABEL_DOWN), labels)
+    return labels
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -483,12 +506,13 @@ def _train_star_cast(model, tokenizer, params: dict, tdir: str, device) -> dict:
             train_time = {k: v[:, :train_len] for k, v in times.items()}
 
             with _autocast_ctx(use_amp, amp_dtype):
-                logits_c, logits_f, _ = model(
+                logits_c, logits_f, latent_states, hidden = model(
                     golden_c[:, :-1], golden_f[:, :-1],
                     train_time["minute"][:, :train_len - 1],
                     train_time["day"][:, :train_len - 1],
                     train_time["month"][:, :train_len - 1],
                     train_time["year"][:, :train_len - 1],
+                    return_hidden=True,
                     neftune_alpha=0.0,
                 )
 
@@ -534,9 +558,24 @@ def _train_star_cast(model, tokenizer, params: dict, tdir: str, device) -> dict:
                 else:
                     star_ce = torch.tensor(0.0, device=device)
 
+                # Engine 3: Direction-Explicit Classification (Phase 8-2)
+                if p.get("direction_weight", 0.0) > 0.0:
+                    dir_labels = _direction_labels(
+                        actual_h, p["direction_epsilon_scale"])
+                    dir_logits = model.compute_direction_logits_at_positions(
+                        hidden, latent_states, start=start, end=start + horizon)
+                    flat_w = p["direction_ce_flat_weight"]
+                    cw = torch.tensor([1.0, flat_w, 1.0], device=device, dtype=dir_logits.dtype)
+                    dir_loss = F.cross_entropy(
+                        dir_logits.reshape(-1, 3).float(),
+                        dir_labels.reshape(-1), weight=cw)
+                else:
+                    dir_loss = torch.tensor(0.0, device=device)
+
                 loss = (p["step_asym_weight"] * step_loss +
                         p["path_asym_weight"] * path_loss +
-                        p["star_ce_weight"] * star_ce)
+                        p["star_ce_weight"] * star_ce +
+                        p.get("direction_weight", 0.0) * dir_loss)
 
                 # Scale loss by gradient accumulation steps
                 loss = loss / ga_steps

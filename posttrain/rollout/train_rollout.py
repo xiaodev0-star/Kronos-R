@@ -847,6 +847,7 @@ def _configure_trainable(model, cfg):
             "fine_gate.",
             "fine_norm.",
             "head_fine.",
+            "direction_head.",   # Phase 8-2: direction classifier head
         )
         for name, param in model.named_parameters():
             if name.startswith(trainable_prefixes):
